@@ -1,0 +1,156 @@
+# App Cloner
+
+Clones an Android app on the device: gives it a new name and package, optionally a badged icon,
+re-signs it with a key you control, and installs or exports the result. It then remembers where the
+clone came from, so it can tell you when the original has been updated and rebuild the clone from
+the new version.
+
+Signing is the same machinery as [apk-signer](https://github.com/miron404/apk-signer): multiple
+identities, private keys sealed behind the Titan M2 secure element, and Google's `apksig` for the
+signatures themselves. Backup archives are format-compatible, so identities move between the two
+apps.
+
+## What it actually does to an APK
+
+There is no Android SDK on the device, so nothing is decompiled and no resources are recompiled.
+[ARSCLib](https://github.com/REAndroid/ARSCLib) is used to edit the binary `AndroidManifest.xml`
+and `resources.arsc` in place, and everything else — dex, native libraries, assets — is copied
+across untouched.
+
+Renaming the package is more than swapping one attribute:
+
+| What | Why it has to change |
+| --- | --- |
+| `package` on `<manifest>`, and the package name in `resources.arsc` | Both together, so `Resources.getIdentifier(name, type, getPackageName())` still resolves. |
+| `android:name` on every component | It is relative to the manifest package. Expanded to an absolute class name **before** the package moves, or every component points at a class that is not there. |
+| `<provider android:authorities>` | A device-global namespace. A duplicate is rejected with `INSTALL_FAILED_CONFLICTING_PROVIDER`. |
+| `<permission android:name>` the app declares, and its own `uses-permission` | Also global: `INSTALL_FAILED_DUPLICATE_PERMISSION`. |
+| `android:taskAffinity` | Left alone, the clone would share a recents entry with the original. |
+| `android:process` (unless it starts with `:`) | A global process name would be shared too. |
+| `android:sharedUserId` | Removed. It cannot survive a change of signing key, and the install would fail. |
+
+Then the APK is re-aligned and signed with v1, v2 and v3, and `ApkVerifier` has to accept the
+result before it is offered to you.
+
+## Split APKs
+
+Almost anything installed from Play arrives as a base plus config splits. All of them are rewritten
+and signed with the same key, the same `minSdk` and the same set of schemes — a session install
+rejects a set whose members disagree — and committed to one `PackageInstaller` session together.
+Export writes a `.apks` zip when there is more than one file.
+
+Sources can be an installed app, one APK, several APKs selected at once, or a single
+`.apks`/`.xapk`/`.apkm` container.
+
+## The icon, and Material You
+
+This is the part with a real constraint. A themed icon is drawn from the `<monochrome>` layer of an
+adaptive icon and filled with a single colour from the wallpaper palette. With themed icons on,
+**every icon on the device is the same colour**, so a badge painted onto the foreground is simply
+not visible, and recolouring the icon achieves nothing at all.
+
+The only thing that survives the tint is shape. So the badge is *cut out* of the monochrome layer
+rather than drawn on it: a transparent ring, a solid disc inside it, and the character knocked back
+out of the disc. Tinted, that reads as a clear marker; untinted, the same badge is drawn in colour
+on the foreground layer, so it looks deliberate either way.
+
+The source icon is rendered by asking the platform for the real `Drawable` — `getPackageArchiveInfo`
+with the source and split paths filled in, which works for an APK that is not installed — and
+splitting an `AdaptiveIconDrawable` into its three layers. A legacy icon with no layers is inset
+into the mask's safe area and given a background sampled from its own colours, and its monochrome
+layer is derived from its alpha.
+
+The new icon is added as a **new** resource rather than overwriting the app's existing one, because
+an icon resource is usually referenced from a notification or an about screen as well. Only the
+launcher's view of it is repointed, including any launcher activity that declares an
+`android:icon` of its own — otherwise the launcher shows the unbadged original.
+
+"Keep the original" is always available and is the option that cannot go wrong.
+
+## Deep rename (off by default)
+
+Renaming the package in the manifest is invisible to code that was compiled against the old name.
+The usual casualty is `BuildConfig.APPLICATION_ID`, which the compiler inlines as a string literal:
+an app that builds a `FileProvider` authority from it asks for `com.old.provider` while its
+manifest now declares `com.new.provider`, and crashes the first time it shares a file.
+
+With deep rename on, the string pools of every `classes*.dex` are rewritten. Two rules keep it as
+narrow as it can usefully be:
+
+- Only strings that are exactly the old package, or live under it as `old.something`, are touched.
+  Type descriptors are written `Lcom/old/Thing;` with slashes, so classes are never renamed.
+- A string that names a class the app actually contains is left alone — those are `Class.forName`
+  targets and reflection keys, and rewriting them would point the app at a class that does not
+  exist. Every dex in the app is indexed before any of them is edited, so a class in `classes2.dex`
+  still protects a string in `classes.dex`.
+
+It is still a modification of someone else's code, and it is marked experimental for that reason.
+
+## What will not work
+
+Cloning changes the package name and the signing key. Anything keyed to either of those breaks, and
+no amount of rewriting fixes it:
+
+- **Google Play services.** Maps, Sign-In, Play Integrity and SafetyNet are tied to the package name
+  and certificate fingerprint registered with Google. The clone is neither.
+- **Firebase Cloud Messaging.** `google-services.json` is compiled in with the original package
+  name; registration fails.
+- **Apps that check their own signature.** Banking apps, DRM-protected media, anything with an
+  integrity check — the clone is detected.
+- **Server-side app identity.** An app that sends its package name to its own backend sends the new
+  one.
+- **Anything relying on `sharedUserId`**, which is dropped.
+
+The app scans for the first two while it works and says so before you install.
+
+## Detecting updates
+
+A clone and its source are unrelated packages as far as the system is concerned, so nothing links
+them. This app keeps that link itself: for every clone it stores the source's package name and the
+version code it was built from. On each launch it asks the package manager what version of that
+source is installed now, and a clone whose source has moved on is flagged.
+
+Rebuilding replays the same choices — name, package, icon, identity, deep rename — against the new
+version. Because the signing key is the same, installing the result **updates** the existing clone
+and its data survives.
+
+This needs `QUERY_ALL_PACKAGES` to see other apps at all. There is still no `INTERNET` permission:
+everything compared here is read locally.
+
+## Building
+
+CI (`.github/workflows/build.yml`) runs on GitHub Actions and uploads the debug and release APKs.
+
+```
+./gradlew :app:assembleDebug
+./gradlew :app:testDebugUnitTest
+```
+
+The rewriting and signing tests use the debug APK as their fixture, so run `assembleDebug` first;
+they skip themselves otherwise rather than a binary being committed. The rewriting test is the one
+worth knowing about: it renames the fixture, writes it out, and then reads it back with the
+platform's own manifest parser and with `ApkVerifier`, because a binary manifest that merely looks
+right is worth nothing.
+
+### Release signing
+
+Without secrets configured, CI mints a throwaway RSA key per run, names the artifact
+`...-cikey.apk`, and prints its SHA-256 in the log. The key differs every run, so a new build
+replaces rather than updates an existing install — export an encrypted backup of the vault first if
+it has identities in it. To sign with a key you control, set `SIGNING_KEYSTORE_B64`,
+`SIGNING_KEYSTORE_PASSWORD`, `SIGNING_KEY_ALIAS` and `SIGNING_KEY_PASSWORD` as repository secrets.
+
+## Requirements
+
+- Android 13 (API 33) or newer
+- A secure lock screen; a StrongBox-backed device (Pixel 3 and later) for hardware key protection
+- Enough free space for roughly three copies of the app being cloned while it is being built
+
+## Notes
+
+- Signature schemes are fixed at v1 + v2 + v3, which is right for every device this can install to.
+- Unlike apk-signer, the window is not `FLAG_SECURE`. Nothing secret is ever on screen here — no
+  private key material is displayed — and blocking screenshots of an app list is not worth it.
+- Cloning apps you have the right to use is a normal thing to do on your own device. Redistributing
+  a modified, re-signed build of someone else's app usually is not; that is between you and their
+  licence.

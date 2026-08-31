@@ -1,0 +1,108 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Configure release signing
+        env:
+          SIGNING_KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_B64 }}
+          SIGNING_KEYSTORE_PASSWORD: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          if [ -z "$SIGNING_KEYSTORE_B64" ]; then
+            # No secrets: mint a throwaway key so the release APK is a real release build that can
+            # be installed. It differs every run, so an existing install has to be replaced rather
+            # than updated — export an encrypted backup of the vault first.
+            echo "No signing secrets configured; generating a throwaway release key."
+            echo "RELEASE_SIGNED=false" >> "$GITHUB_ENV"
+            SIGNING_KEYSTORE_PASSWORD="$(head -c 24 /dev/urandom | base64)"
+            SIGNING_KEY_ALIAS=ci
+            SIGNING_KEY_PASSWORD="$SIGNING_KEYSTORE_PASSWORD"
+            keytool -genkeypair \
+              -keystore release.jks -storetype PKCS12 \
+              -alias "$SIGNING_KEY_ALIAS" -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$SIGNING_KEYSTORE_PASSWORD" -keypass "$SIGNING_KEY_PASSWORD" \
+              -dname "CN=App Cloner throwaway CI key, OU=Unknown, O=Unknown, L=Unknown, ST=Unknown, C=Unknown"
+            keytool -list -v -keystore release.jks -storepass "$SIGNING_KEYSTORE_PASSWORD" \
+              | grep -i 'SHA256:' || true
+          else
+            echo "RELEASE_SIGNED=true" >> "$GITHUB_ENV"
+            printf '%s' "$SIGNING_KEYSTORE_B64" | base64 -d > release.jks
+          fi
+          {
+            echo "storeFile=release.jks"
+            echo "storePassword=$SIGNING_KEYSTORE_PASSWORD"
+            echo "keyAlias=$SIGNING_KEY_ALIAS"
+            echo "keyPassword=$SIGNING_KEY_PASSWORD"
+          } > keystore.properties
+
+      # Built first: the rewriting and signing tests use the debug APK as their fixture and skip
+      # themselves when there is not one.
+      - name: Assemble debug
+        run: ./gradlew --no-daemon :app:assembleDebug
+
+      - name: Unit tests
+        run: ./gradlew --no-daemon :app:testDebugUnitTest
+
+      - name: Lint
+        run: ./gradlew --no-daemon :app:lintDebug
+
+      - name: Assemble release
+        run: ./gradlew --no-daemon :app:assembleRelease
+
+      - name: Label a throwaway-signed release
+        if: env.RELEASE_SIGNED == 'false'
+        run: |
+          cd app/build/outputs/apk/release
+          for f in *.apk; do mv "$f" "${f%.apk}-cikey.apk"; done
+
+      - name: Remove signing material
+        if: always()
+        run: rm -f release.jks keystore.properties
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: apks
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports
+          path: |
+            app/build/reports/
+            app/build/test-results/
+          if-no-files-found: ignore

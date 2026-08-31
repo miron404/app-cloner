@@ -1,0 +1,61 @@
+package io.github.miron404.appcloner
+
+import android.app.Application
+import android.content.Context
+import io.github.miron404.appcloner.clone.CloneRegistry
+import io.github.miron404.appcloner.clone.ClonePipeline
+import io.github.miron404.appcloner.clone.Installer
+import io.github.miron404.appcloner.core.AppSettings
+import io.github.miron404.appcloner.core.Bc
+import io.github.miron404.appcloner.core.MasterKey
+import io.github.miron404.appcloner.core.SystemAuthenticator
+import io.github.miron404.appcloner.core.Vault
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import java.io.File
+
+/** Hand-rolled service locator; the graph is small enough that a DI framework would be noise. */
+class AppContainer(context: Context) {
+    val settings = AppSettings(context)
+    val authenticator = SystemAuthenticator()
+    val masterKey = MasterKey(authenticator)
+    val vault = Vault(File(context.filesDir, "vault"), masterKey, settings)
+    val registry = CloneRegistry(File(context.filesDir, "clones.json"))
+    val pipeline = ClonePipeline(context)
+    val installer = Installer(context)
+
+    /** Where finished clones are kept so they can still be installed or exported later. */
+    val outputRoot = File(context.filesDir, "clones")
+
+    /** Scratch space for staged sources and half-written APKs. Safe to wipe at any time. */
+    val workRoot = File(context.cacheDir, "work")
+
+    /**
+     * Builds run here rather than in a view model scope, so swiping the app away mid-build does
+     * not throw away twenty minutes of repacking and signing. The foreground service keeps the
+     * process around for as long as this scope has work in it.
+     */
+    val jobScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+}
+
+class AppClonerApplication : Application() {
+
+    lateinit var container: AppContainer
+        private set
+
+    override fun onCreate() {
+        super.onCreate()
+        // Android's built-in "BC" provider is a stripped subset; swap in the full build before any
+        // crypto runs so PKCS#12 writing and certificate building resolve to it.
+        Bc.install()
+        container = AppContainer(this)
+        // Finish any rekey a previous run was interrupted mid-way through.
+        runCatching { container.vault.repair() }
+        // Nothing in the work directory outlives the run that created it.
+        runCatching { container.workRoot.deleteRecursively() }
+    }
+}
+
+val Context.container: AppContainer
+    get() = (applicationContext as AppClonerApplication).container

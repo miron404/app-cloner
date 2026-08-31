@@ -1,0 +1,14 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Two overlapping rounded squares: the original behind, the copy in front. -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillAlpha="0.45"
+        android:pathData="M42,30h26c3.3,0 6,2.7 6,6v26c0,3.3 -2.7,6 -6,6h-3v-25c0,-3.3 -2.7,-6 -6,-6h-23v-1C36,32.7 38.7,30 42,30z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M40,41h26c3.3,0 6,2.7 6,6v26c0,3.3 -2.7,6 -6,6H40c-3.3,0 -6,-2.7 -6,-6V47C34,43.7 36.7,41 40,41zM40,47v26h26V47H40z" />
+</vector>
