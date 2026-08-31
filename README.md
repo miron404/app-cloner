@@ -126,11 +126,22 @@ CI (`.github/workflows/build.yml`) runs on GitHub Actions and uploads the debug 
 ./gradlew :app:testDebugUnitTest
 ```
 
-The rewriting and signing tests use the debug APK as their fixture, so run `assembleDebug` first;
-they skip themselves otherwise rather than a binary being committed. The rewriting test is the one
-worth knowing about: it renames the fixture, writes it out, and then reads it back with the
-platform's own manifest parser and with `ApkVerifier`, because a binary manifest that merely looks
-right is worth nothing.
+The tests that touch APKs use the debug build as their fixture, so run `assembleDebug` first; they
+skip themselves otherwise rather than a binary being committed.
+
+They exist because none of this can be checked by the compiler. Everything here writes binary
+formats by hand, so each test writes an APK out and reads it back with a different parser than the
+one that produced it:
+
+| Test | What it proves |
+| --- | --- |
+| `RewriteApkTest` | The renamed APK's package is what the platform's own manifest parser reports, no component name is left relative, and the result still signs and verifies. |
+| `RewriteApkTest` (dex) | A dex whose string pool was rewritten can be parsed again — which is the real check, since an unsorted string table or a stale offset makes it unreadable — and that class names and type descriptors came through untouched. |
+| `IconInjectionTest` | The hand-built `<adaptive-icon>` document round-trips through the parser, the manifest's icon id resolves to an entry carrying both configurations, and each layer references a drawable that was actually added. |
+| `ClonePipelineTest` | A whole build in the right order: renamed, re-iconed, signed, and accepted by `ApkVerifier` as the identity that signed it. |
+
+What no test here covers is the last step: a clone actually installing and running on a device.
+`PackageInstaller` needs a real user confirming a real dialog, so that is the part to try by hand.
 
 ### Release signing
 
