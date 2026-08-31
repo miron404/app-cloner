@@ -23,7 +23,8 @@ import java.util.zip.ZipEntry
  */
 object IconInjector {
 
-    private const val NAME = "ic_clone_launcher"
+    /** Resource and file name of the generated icon; the tests look it up by this. */
+    const val NAME = "ic_clone_launcher"
 
     /**
      * Configuration qualifiers, written without a leading dash: ResConfig splits on '-', so the
@@ -33,28 +34,48 @@ object IconInjector {
     private const val XXXHDPI = "xxxhdpi"
 
     /** Writes [layers] into [module] and returns the resource id the manifest should point at. */
-    fun inject(module: ApkModule, layers: IconLayers): Int {
+    fun inject(module: ApkModule, layers: IconLayers): Int = inject(
+        module = module,
+        foreground = IconFactory.encodePng(layers.foreground),
+        background = IconFactory.encodePng(layers.background),
+        monochrome = layers.monochrome?.let(IconFactory::encodePng),
+        flattened = IconFactory.encodePng(IconFactory.flatten(layers)),
+    )
+
+    /**
+     * The same thing in terms of encoded images rather than bitmaps.
+     *
+     * Kept separate so the resource-table and binary-XML work can be exercised on a plain JVM,
+     * where `Bitmap` and `Canvas` do not exist.
+     */
+    fun inject(
+        module: ApkModule,
+        foreground: ByteArray,
+        background: ByteArray,
+        monochrome: ByteArray?,
+        flattened: ByteArray,
+    ): Int {
         val table = module.tableBlock
             ?: throw IllegalStateException("APK has no resource table to add an icon to")
         val pkg = table.pickOne()
             ?: throw IllegalStateException("Resource table declares no package")
 
-        val foreground = addLayer(module, pkg, "foreground", IconFactory.encodePng(layers.foreground))
-        val background = addLayer(module, pkg, "background", IconFactory.encodePng(layers.background))
-        val monochrome = layers.monochrome
-            ?.let { addLayer(module, pkg, "monochrome", IconFactory.encodePng(it)) }
+        val foregroundId = addLayer(module, pkg, "foreground", foreground)
+        val backgroundId = addLayer(module, pkg, "background", background)
+        val monochromeId = monochrome
+            ?.let { addLayer(module, pkg, "monochrome", it) }
             ?: 0
 
         val xmlPath = "res/mipmap-anydpi-v26/$NAME.xml"
         val entry = pkg.getOrCreate(ANYDPI_V26, "mipmap", NAME)
         entry.setValueAsString(xmlPath)
-        module.addFile(xmlPath, adaptiveIcon(pkg, background, foreground, monochrome))
+        module.addFile(xmlPath, adaptiveIcon(pkg, backgroundId, foregroundId, monochromeId))
 
         val pngPath = "res/mipmap-xxxhdpi/$NAME.png"
         // Same type and name, so this shares the resource id with the entry above and only
         // differs in the configuration it answers for.
         pkg.getOrCreate(XXXHDPI, "mipmap", NAME).setValueAsString(pngPath)
-        module.addFile(pngPath, IconFactory.encodePng(IconFactory.flatten(layers)))
+        module.addFile(pngPath, flattened)
 
         return entry.resourceId
     }
