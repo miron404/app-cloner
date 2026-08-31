@@ -33,21 +33,15 @@ object IconInjector {
     private const val ANYDPI_V26 = "anydpi-v26"
     private const val XXXHDPI = "xxxhdpi"
 
-    /** Writes [layers] into [module] and returns the resource id the manifest should point at. */
-    fun inject(module: ApkModule, layers: IconLayers): Int = inject(
+    /** Writes [images] into [module] and returns the resource id the manifest should point at. */
+    fun inject(module: ApkModule, images: IconImages): Int = inject(
         module = module,
-        foreground = IconFactory.encodePng(layers.foreground),
-        background = IconFactory.encodePng(layers.background),
-        monochrome = layers.monochrome?.let(IconFactory::encodePng),
-        flattened = IconFactory.encodePng(IconFactory.flatten(layers)),
+        foreground = images.foreground,
+        background = images.background,
+        monochrome = images.monochrome,
+        flattened = images.flattened,
     )
 
-    /**
-     * The same thing in terms of encoded images rather than bitmaps.
-     *
-     * Kept separate so the resource-table and binary-XML work can be exercised on a plain JVM,
-     * where `Bitmap` and `Canvas` do not exist.
-     */
     fun inject(
         module: ApkModule,
         foreground: ByteArray,

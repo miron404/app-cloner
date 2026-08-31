@@ -51,6 +51,28 @@ class SourceApks(
     val totalBytes: Long get() = all.sumOf { it.length() }
 }
 
+/** The images a generated launcher icon is made of, already encoded as PNG. */
+class IconImages(
+    val foreground: ByteArray,
+    val background: ByteArray,
+    /** Absent when the source icon had no themed layer to badge. */
+    val monochrome: ByteArray?,
+    /** Flattened fallback for anything that asks for a raster rather than an adaptive icon. */
+    val flattened: ByteArray,
+)
+
+/**
+ * Renders the clone's launcher icon.
+ *
+ * The pipeline is expressed in terms of this rather than of bitmaps, so it does not need a
+ * `Context` and can be run end to end on a plain JVM. The real implementation is
+ * [io.github.miron404.appcloner.clone.AndroidIconRenderer].
+ */
+fun interface IconRenderer {
+    /** Null when the source app's icon could not be rendered, which is not fatal to a build. */
+    fun render(source: SourceApks, badge: String): IconImages?
+}
+
 /** Everything the user chose before the build starts. */
 data class CloneRequest(
     val label: String,

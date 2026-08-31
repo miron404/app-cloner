@@ -261,3 +261,30 @@ object IconFactory {
 
     private fun Bitmap.mutableCopy(): Bitmap = copy(Bitmap.Config.ARGB_8888, true)
 }
+
+/**
+ * The real [IconRenderer]: asks the platform for the source app's icon, badges it, and hands back
+ * encoded images. Everything that needs `Bitmap`, `Canvas` or a `Context` stops here.
+ */
+class AndroidIconRenderer(private val context: Context) : IconRenderer {
+
+    override fun render(source: SourceApks, badge: String): IconImages? {
+        val drawable = IconFactory.loadIcon(context, source.base, source.splits) ?: return null
+        val original = IconFactory.toLayers(drawable)
+        val badged = try {
+            IconFactory.badge(original, badge)
+        } finally {
+            original.recycle()
+        }
+        return try {
+            IconImages(
+                foreground = IconFactory.encodePng(badged.foreground),
+                background = IconFactory.encodePng(badged.background),
+                monochrome = badged.monochrome?.let(IconFactory::encodePng),
+                flattened = IconFactory.encodePng(IconFactory.flatten(badged)),
+            )
+        } finally {
+            badged.recycle()
+        }
+    }
+}

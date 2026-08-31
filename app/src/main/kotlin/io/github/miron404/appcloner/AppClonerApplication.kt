@@ -3,6 +3,7 @@ package io.github.miron404.appcloner
 import android.app.Application
 import android.content.Context
 import io.github.miron404.appcloner.clone.CloneRegistry
+import io.github.miron404.appcloner.clone.AndroidIconRenderer
 import io.github.miron404.appcloner.clone.ClonePipeline
 import io.github.miron404.appcloner.clone.Installer
 import io.github.miron404.appcloner.core.AppSettings
@@ -22,7 +23,7 @@ class AppContainer(context: Context) {
     val masterKey = MasterKey(authenticator)
     val vault = Vault(File(context.filesDir, "vault"), masterKey, settings)
     val registry = CloneRegistry(File(context.filesDir, "clones.json"))
-    val pipeline = ClonePipeline(context)
+    val pipeline = ClonePipeline(AndroidIconRenderer(context))
     val installer = Installer(context)
 
     /** Where finished clones are kept so they can still be installed or exported later. */

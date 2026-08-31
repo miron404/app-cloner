@@ -1,6 +1,5 @@
 package io.github.miron404.appcloner.clone
 
-import android.content.Context
 import com.reandroid.apk.ApkModule
 import com.reandroid.archive.FileInputSource
 import com.reandroid.arsc.chunk.xml.AndroidManifestBlock
@@ -24,7 +23,7 @@ import kotlin.coroutines.coroutineContext
  * read-only where they lie — and each stage writes a new file, so a failure part way through
  * leaves nothing but rubbish in the work directory.
  */
-class ClonePipeline(private val context: Context) {
+class ClonePipeline(private val icons: IconRenderer) {
 
     suspend fun build(
         source: SourceApks,
@@ -66,15 +65,12 @@ class ClonePipeline(private val context: Context) {
 
         // Rendered from the source APKs before anything is rewritten, because that is where the
         // icon's own resources still are.
-        val layers = if (request.iconMode == IconMode.BADGE) {
+        val images = if (request.iconMode == IconMode.BADGE) {
             onProgress(CloneProgress("Rendering icon"))
-            val drawable = IconFactory.loadIcon(context, source.base, source.splits)
-            if (drawable == null) {
-                warnings += "The source app's icon could not be rendered, so it was left as it is."
-                null
-            } else {
-                IconFactory.toLayers(drawable).let { original ->
-                    IconFactory.badge(original, request.badgeText).also { original.recycle() }
+            icons.render(source, request.badgeText).also {
+                if (it == null) {
+                    warnings += "The source app's icon could not be rendered, so it was left " +
+                        "as it is."
                 }
             }
         } else {
@@ -130,14 +126,14 @@ class ClonePipeline(private val context: Context) {
                         dexSkipped += result.third
                     }
 
-                    if (isBase && layers != null) {
+                    if (isBase && images != null) {
                         val applied = runCatching {
-                            val resourceId = IconInjector.inject(module, layers)
+                            val resourceId = IconInjector.inject(module, images)
                             ManifestRewriter.setIcon(manifest, resourceId)
                         }
                         if (applied.isSuccess) {
                             iconSummary = "badged '${request.badgeText}'" +
-                                if (layers.monochrome == null) {
+                                if (images.monochrome == null) {
                                     ", no themed layer in the original"
                                 } else {
                                     ", themed layer badged too"
@@ -207,7 +203,6 @@ class ClonePipeline(private val context: Context) {
                 warnings = warnings,
             )
         } finally {
-            layers?.recycle()
             unsignedDir.deleteRecursively()
             dexScratch.deleteRecursively()
         }
