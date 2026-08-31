@@ -2,7 +2,7 @@ package io.github.miron404.appcloner.clone
 
 import android.content.Context
 import com.reandroid.apk.ApkModule
-import com.reandroid.archive.ByteInputSource
+import com.reandroid.archive.FileInputSource
 import com.reandroid.arsc.chunk.xml.AndroidManifestBlock
 import com.reandroid.arsc.chunk.xml.ResXmlElement
 import com.reandroid.arsc.value.ValueType
@@ -40,6 +40,9 @@ class ClonePipeline(private val context: Context) {
         require(PackageNames.isValid(newPackage)) { "'$newPackage' is not a valid package name" }
 
         val unsignedDir = File(outDir, "unsigned").apply { mkdirs() }
+        // Rewritten dex files are written here rather than held as byte arrays: a multidex app
+        // would otherwise keep every one of them in memory until the APK is written out.
+        val dexScratch = File(outDir, "dex").apply { mkdirs() }
         outDir.mkdirs()
 
         val warnings = mutableListOf<String>()
@@ -112,7 +115,16 @@ class ClonePipeline(private val context: Context) {
                     )
 
                     if (classIndex != null) {
-                        val result = rewriteDex(module, oldPackage, newPackage, classIndex)
+                        val result = rewriteDex(
+                            module = module,
+                            oldPackage = oldPackage,
+                            newPackage = newPackage,
+                            index = classIndex,
+                            scratch = dexScratch,
+                            // The module name is the same for a base and its splits, so the
+                            // position in the set is what keeps the scratch files apart.
+                            prefix = index.toString(),
+                        )
                         dexFiles += result.first
                         dexChanged += result.second
                         dexSkipped += result.third
@@ -197,6 +209,7 @@ class ClonePipeline(private val context: Context) {
         } finally {
             layers?.recycle()
             unsignedDir.deleteRecursively()
+            dexScratch.deleteRecursively()
         }
     }
 
@@ -211,6 +224,8 @@ class ClonePipeline(private val context: Context) {
         oldPackage: String,
         newPackage: String,
         index: DexRewriter.ClassIndex,
+        scratch: File,
+        prefix: String,
     ): Triple<Int, Int, Int> {
         var files = 0
         var changed = 0
@@ -219,14 +234,16 @@ class ClonePipeline(private val context: Context) {
             val source = module.zipEntryMap.getInputSource(name) ?: continue
             files++
             val method = source.method
-            val bytes = source.openStream().use { it.readBytes() }
-            val result = DexRewriter.rewrite(bytes, oldPackage, newPackage, index)
+            val output = File(scratch, "$prefix-$name")
+            val result = source.openStream().use { stream ->
+                DexRewriter.rewrite(stream, oldPackage, newPackage, index, output)
+            }
             changed += result.changed
             skipped += result.skipped
-            val rewritten = result.bytes ?: continue
+            if (!result.written) continue
             module.zipEntryMap.remove(name)
             module.zipEntryMap.add(
-                ByteInputSource(rewritten, name).apply { this.method = method }
+                FileInputSource(output, name).apply { this.method = method }
             )
         }
         return Triple(files, changed, skipped)
@@ -246,6 +263,8 @@ class ClonePipeline(private val context: Context) {
                 zip.entries().asSequence()
                     .filter { !it.isDirectory && DexRewriter.isDexEntry(it.name) }
                     .forEach { entry ->
+                        // One dex at a time, and only its bytes: indexing reads the string pool
+                        // directly rather than parsing the file into objects.
                         val bytes = zip.getInputStream(entry).use { it.readBytes() }
                         names += DexRewriter.indexClasses(bytes, oldPackage)
                     }

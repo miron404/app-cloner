@@ -96,6 +96,9 @@ android {
         unitTests {
             isIncludeAndroidResources = true
             isReturnDefaultValues = true
+            // Rebuilding a dex lays out every offset in the file again, so the test that does it
+            // to this app's own debug build needs more than the default heap.
+            all { test -> test.maxHeapSize = "2g" }
         }
     }
 

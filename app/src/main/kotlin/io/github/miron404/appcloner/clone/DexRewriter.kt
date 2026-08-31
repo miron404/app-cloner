@@ -3,6 +3,8 @@ package io.github.miron404.appcloner.clone
 import com.reandroid.dex.id.StringId
 import com.reandroid.dex.model.DexFile
 import com.reandroid.dex.sections.SectionType
+import java.io.File
+import java.io.InputStream
 
 /**
  * Rewrites package-derived string constants inside the app's own bytecode.
@@ -20,51 +22,41 @@ import com.reandroid.dex.sections.SectionType
  *    themselves are never renamed and the code keeps working.
  *  - A string that names a class the app actually contains is left alone. Those are
  *    `Class.forName` targets and reflection keys; rewriting them would point the app at a class
- *    that does not exist. This is why every dex is scanned before any of them is edited.
+ *    that does not exist. This is why every dex is indexed before any of them is edited.
+ *
+ * Rebuilding a dex is the memory-hungry part of a clone, because re-sorting the string pool means
+ * every offset in the file has to be laid out again. Only one dex is ever held as an object model,
+ * it is read straight from the archive and written straight to a file, and the read-only indexing
+ * pass avoids the model entirely.
  */
 object DexRewriter {
 
-    /** Result of the read-only first pass: the dotted names of every class the app defines. */
+    /** The dotted names of every class the app defines under the package being renamed. */
     class ClassIndex(private val names: Set<String>) {
         operator fun contains(dotted: String) = dotted in names
         val size: Int get() = names.size
     }
 
-    /**
-     * Collects the class names in one dex, as dotted names.
-     *
-     * Every type descriptor is a string in the pool, so scanning the string section finds them
-     * without also materialising the class table.
-     */
-    fun indexClasses(dexBytes: ByteArray, oldPackage: String): Set<String> {
-        val prefix = "L" + oldPackage.replace('.', '/')
-        val names = mutableSetOf<String>()
-        DexFile.read(dexBytes).use { dex ->
-            dex.getItems(SectionType.STRING_ID).forEach { id: StringId ->
-                val text = id.string ?: return@forEach
-                if (!text.startsWith(prefix) || !text.endsWith(";")) return@forEach
-                // Guard against 'Lcom/oldest/...' matching the prefix of 'com.old'.
-                val after = text.getOrNull(prefix.length)
-                if (after != '/' && after != ';') return@forEach
-                names += text.substring(1, text.length - 1).replace('/', '.')
-            }
-        }
-        return names
-    }
+    /** Collects the class names in one dex by walking its string pool directly. */
+    fun indexClasses(dexBytes: ByteArray, oldPackage: String): Set<String> =
+        DexStringTable.classNamesUnder(dexBytes, oldPackage)
 
     /**
-     * Rewrites one dex against [index]. Returns the new bytes, or null when nothing changed and
-     * the original can be kept byte for byte.
+     * Rewrites one dex read from [input], writing the result to [output].
+     *
+     * [Rewritten.written] is false when no string matched, in which case [output] is untouched and
+     * the caller should keep the original entry byte for byte.
      */
     fun rewrite(
-        dexBytes: ByteArray,
+        input: InputStream,
         oldPackage: String,
         newPackage: String,
         index: ClassIndex,
+        output: File,
     ): Rewritten {
         var changed = 0
         var skipped = 0
-        return DexFile.read(dexBytes).use { dex ->
+        return DexFile.read(input).use { dex ->
             dex.getItems(SectionType.STRING_ID).forEach { id: StringId ->
                 val text = id.string ?: return@forEach
                 val moved = ManifestRewriter.swapPrefix(text, oldPackage, newPackage)
@@ -77,17 +69,18 @@ object DexRewriter {
                 changed++
             }
             if (changed == 0) {
-                Rewritten(null, 0, skipped)
+                Rewritten(false, 0, skipped)
             } else {
                 // String ids must stay sorted by their contents or the verifier rejects the dex.
                 // refreshFull re-sorts the string sections and rebuilds every offset that moved.
                 dex.refreshFull()
-                Rewritten(dex.bytes, changed, skipped)
+                dex.write(output)
+                Rewritten(true, changed, skipped)
             }
         }
     }
 
-    class Rewritten(val bytes: ByteArray?, val changed: Int, val skipped: Int)
+    class Rewritten(val written: Boolean, val changed: Int, val skipped: Int)
 
     /** Names of the entries a dex rewrite has to consider, in the order Android loads them. */
     fun isDexEntry(name: String): Boolean =

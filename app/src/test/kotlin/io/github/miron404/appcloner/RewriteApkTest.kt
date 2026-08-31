@@ -11,6 +11,7 @@ import io.github.miron404.appcloner.core.ApkSigningService
 import io.github.miron404.appcloner.core.SignOptions
 import io.github.miron404.appcloner.core.SignatureSchemes
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
@@ -107,46 +108,64 @@ class RewriteApkTest {
         val old = "io.github.miron404.appcloner"
         val new = "io.github.miron404.cloned"
 
-        val dexes = ZipFile(source).use { zip ->
-            zip.entries().asSequence()
-                .filter { DexRewriter.isDexEntry(it.name) }
-                .map { zip.getInputStream(it).use { stream -> stream.readBytes() } }
-                .toList()
-        }
-        assertTrue("fixture has no dex files", dexes.isNotEmpty())
-
-        val classNames = dexes.flatMap { DexRewriter.indexClasses(it, old).toList() }.toSet()
+        val classNames = mutableSetOf<String>()
+        forEachDex(source) { bytes -> classNames += DexRewriter.indexClasses(bytes, old) }
         assertTrue("no classes found under $old", classNames.isNotEmpty())
         val index = DexRewriter.ClassIndex(classNames)
 
         var rewrittenAny = false
-        for (dex in dexes) {
-            val result = DexRewriter.rewrite(dex, old, new, index)
-            val bytes = result.bytes ?: continue
-            rewrittenAny = true
+        ZipFile(source).use { zip ->
+            val entries = zip.entries().asSequence()
+                .filter { DexRewriter.isDexEntry(it.name) }
+                .toList()
+            for (entry in entries) {
+                val output = File(temporaryFolder.root, "rewritten-${entry.name}")
+                val result = zip.getInputStream(entry).use { stream ->
+                    DexRewriter.rewrite(stream, old, new, index, output)
+                }
+                if (!result.written) continue
+                rewrittenAny = true
+                assertTrue("nothing was renamed in ${entry.name}", result.changed > 0)
 
-            // Re-reading is the real assertion: a dex whose string ids are out of order, or whose
-            // offsets were not rebuilt, does not survive being parsed again.
-            DexFile.read(bytes).use { reloaded ->
-                val strings = reloaded.getItems(SectionType.STRING_ID).asSequence()
-                    .mapNotNull { it.string }
-                    .toList()
-                assertTrue(
+                // Re-reading is the real assertion: a dex whose string ids are out of order, or
+                // whose offsets were not rebuilt, does not survive being parsed again.
+                var renamedAClass = false
+                var rewroteADescriptor = false
+                var keptOriginalDescriptors = false
+                val oldDescriptor = "L" + old.replace('.', '/')
+                val newDescriptor = "L" + new.replace('.', '/')
+                DexFile.read(output).use { reloaded ->
+                    reloaded.getItems(SectionType.STRING_ID).forEach { id ->
+                        val text = id.string ?: return@forEach
+                        if (text.startsWith("$new.") && text in classNames) renamedAClass = true
+                        if (text.startsWith(newDescriptor)) rewroteADescriptor = true
+                        if (text.startsWith(oldDescriptor)) keptOriginalDescriptors = true
+                    }
+                }
+                assertFalse(
                     "a class name was renamed and its class no longer exists",
-                    strings.none { it in classNames && it.startsWith("$new.") },
+                    renamedAClass,
                 )
                 // Descriptors use slashes, so the classes themselves must be untouched.
-                assertTrue(
-                    "a type descriptor was rewritten",
-                    strings.none { it.startsWith("L" + new.replace('.', '/')) },
-                )
+                assertFalse("a type descriptor was rewritten", rewroteADescriptor)
                 assertTrue(
                     "the original type descriptors should still be there",
-                    strings.any { it.startsWith("L" + old.replace('.', '/')) },
+                    keptOriginalDescriptors,
                 )
             }
         }
         assertTrue("nothing was rewritten, so nothing was proved", rewrittenAny)
+    }
+
+    /** Hands each dex in [apk] to [action] one at a time, so only one is ever held in memory. */
+    private fun forEachDex(apk: File, action: (ByteArray) -> Unit) {
+        ZipFile(apk).use { zip ->
+            zip.entries().asSequence()
+                .filter { !it.isDirectory && DexRewriter.isDexEntry(it.name) }
+                .forEach { entry ->
+                    action(zip.getInputStream(entry).use { it.readBytes() })
+                }
+        }
     }
 
     /** Rewrites the fixture into a new package, or returns null when there is no fixture. */
