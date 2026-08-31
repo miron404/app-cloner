@@ -7,7 +7,11 @@ import androidx.compose.material.icons.filled.Android
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.produceState
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
@@ -27,13 +31,13 @@ import kotlinx.coroutines.withContext
 @Composable
 fun rememberAppIcon(packageName: String?, pixels: Int = 128): ImageBitmap? {
     val context = LocalContext.current
-    // produceState is called unconditionally: skipping it when the name is null would change the
-    // shape of the composition and lose the slot on the next recomposition.
-    return produceState<ImageBitmap?>(initialValue = null, key1 = packageName) {
-        value = withContext(Dispatchers.IO) {
-            if (packageName == null) {
-                null
-            } else {
+    var icon by remember(packageName) { mutableStateOf<ImageBitmap?>(null) }
+
+    LaunchedEffect(packageName, pixels) {
+        icon = if (packageName == null) {
+            null
+        } else {
+            withContext(Dispatchers.IO) {
                 runCatching {
                     context.packageManager.getApplicationIcon(packageName)
                         .toBitmap(pixels, pixels)
@@ -41,7 +45,8 @@ fun rememberAppIcon(packageName: String?, pixels: Int = 128): ImageBitmap? {
                 }.getOrNull()
             }
         }
-    }.value
+    }
+    return icon
 }
 
 /** An app icon, falling back to a generic glyph while it loads or when the app is absent. */
