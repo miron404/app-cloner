@@ -2,14 +2,23 @@ package io.github.miron404.appcloner.ui
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -39,9 +48,14 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import io.github.miron404.appcloner.clone.BadgeCorner
 import io.github.miron404.appcloner.clone.CloneRecord
 import io.github.miron404.appcloner.clone.CloneReport
 import io.github.miron404.appcloner.clone.CloneRequest
@@ -64,7 +78,15 @@ fun ConfigureCloneScreen(model: CloneViewModel, onDone: () -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(if (state.built != null) "Clone ready" else "New clone") },
+                title = {
+                    Text(
+                        when {
+                            state.built != null -> "Clone ready"
+                            state.editing != null -> "Rebuild"
+                            else -> "New clone"
+                        }
+                    )
+                },
                 navigationIcon = {
                     IconButton(
                         onClick = {
@@ -94,6 +116,11 @@ fun ConfigureCloneScreen(model: CloneViewModel, onDone: () -> Unit) {
             }
 
             SourceHeader(source)
+
+            val editing = state.editing
+            if (editing != null && state.built == null) {
+                RebuildNote(editing, draft)
+            }
 
             val built = state.built
             val report = state.report
@@ -134,6 +161,26 @@ private fun SourceHeader(source: SourceApks) {
                 )
             }
         }
+    }
+}
+
+/** What a rebuild will do to the clone already on the device. */
+@Composable
+private fun RebuildNote(editing: CloneRecord, draft: CloneRequest) {
+    val movedPackage = draft.packageName != editing.clonePackage
+    SectionCard(if (movedPackage) "This will be a second clone" else "Rebuilding an existing clone") {
+        Text(
+            if (movedPackage) {
+                "The package name has been changed from ${editing.clonePackage}, so what gets " +
+                    "built installs as a new app beside the existing clone and is tracked as a " +
+                    "clone of its own. Change it back to update the existing one in place."
+            } else {
+                "Settings start from the ones this clone was built with. Installing the result " +
+                    "over the clone already on the device keeps its data, as long as the signing " +
+                    "identity below is the one it was signed with (${editing.identityLabel})."
+            },
+            style = MaterialTheme.typography.bodySmall,
+        )
     }
 }
 
@@ -207,7 +254,12 @@ private fun Form(model: CloneViewModel, state: CloneUiState, draft: CloneRequest
                 supportingText = { Text("One or two characters. Usually the clone's number.") },
                 modifier = Modifier.fillMaxWidth(),
             )
+            CornerPicker(
+                selected = draft.badgeCorner,
+                onSelect = { corner -> model.editDraft { it.copy(badgeCorner = corner) } },
+            )
         }
+        IconPreviewRow(state.preview, draft.iconMode)
     }
 
     SectionCard("Signing identity") {
@@ -252,7 +304,142 @@ private fun Form(model: CloneViewModel, state: CloneUiState, draft: CloneRequest
         enabled = draft.label.isNotBlank() && packageValid && draft.identityId.isNotBlank(),
         modifier = Modifier.fillMaxWidth(),
     ) {
-        Text("Build clone")
+        Text(if (state.editing != null) "Rebuild clone" else "Build clone")
+    }
+}
+
+/**
+ * Which corner the badge goes in, drawn rather than described.
+ *
+ * The cells are the icon in miniature, so the choice reads at a glance; the preview above shows
+ * what it actually does to this app's icon.
+ */
+@Composable
+private fun CornerPicker(selected: BadgeCorner, onSelect: (BadgeCorner) -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            "Corner · ${selected.label.lowercase()}",
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            for (corner in BadgeCorner.entries) {
+                val active = corner == selected
+                Box(
+                    Modifier
+                        .size(52.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .border(
+                            width = if (active) 2.dp else 1.dp,
+                            color = if (active) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.outlineVariant
+                            },
+                            shape = RoundedCornerShape(14.dp),
+                        )
+                        .selectable(selected = active, onClick = { onSelect(corner) })
+                        .padding(7.dp)
+                ) {
+                    Box(
+                        Modifier
+                            .align(corner.alignment())
+                            .size(16.dp)
+                            .clip(CircleShape)
+                            .background(
+                                if (active) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                }
+                            )
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun BadgeCorner.alignment(): Alignment = when (this) {
+    BadgeCorner.TOP_LEFT -> Alignment.TopStart
+    BadgeCorner.TOP_RIGHT -> Alignment.TopEnd
+    BadgeCorner.BOTTOM_LEFT -> Alignment.BottomStart
+    BadgeCorner.BOTTOM_RIGHT -> Alignment.BottomEnd
+}
+
+/**
+ * The icon as it will be, both ways round.
+ *
+ * The themed tile is the monochrome layer tinted, which is all a launcher draws with Material You
+ * themed icons on. It is the case the cut-out badge exists for, so it is worth seeing before the
+ * build rather than after installing.
+ */
+@Composable
+private fun IconPreviewRow(preview: IconPreview?, mode: IconMode) {
+    Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+        PreviewTile("Launcher") {
+            if (preview != null) {
+                Image(
+                    bitmap = preview.normal,
+                    contentDescription = null,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+        }
+        PreviewTile("Themed", MaterialTheme.colorScheme.primaryContainer) {
+            val themed = preview?.themed
+            if (themed != null) {
+                Image(
+                    bitmap = themed,
+                    contentDescription = null,
+                    modifier = Modifier.fillMaxSize(),
+                    colorFilter = ColorFilter.tint(MaterialTheme.colorScheme.onPrimaryContainer),
+                )
+            }
+        }
+        Text(
+            when {
+                preview == null -> "Rendering the icon…"
+                preview.themed == null && mode == IconMode.BADGE ->
+                    "This icon has no themed layer, so one is derived from its outline. Themed " +
+                        "launchers will show that instead."
+
+                mode == IconMode.KEEP -> "The clone keeps the icon it came from."
+                else -> "The badge is cut out of the themed layer, so it survives the tint."
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.align(Alignment.CenterVertically),
+        )
+    }
+}
+
+@Composable
+private fun PreviewTile(
+    label: String,
+    fill: Color = Color.Transparent,
+    content: @Composable BoxScope.() -> Unit,
+) {
+    Column(
+        // Held to the tile's own width so a label cannot widen the row past the screen.
+        modifier = Modifier.width(56.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Box(
+            Modifier
+                .size(56.dp)
+                .clip(RoundedCornerShape(14.dp))
+                .background(fill),
+            content = content,
+        )
+        Text(
+            label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+        )
     }
 }
 

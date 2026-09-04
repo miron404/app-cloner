@@ -18,6 +18,43 @@ enum class IconMode(val label: String, val description: String) {
     ),
 }
 
+/**
+ * The badge's geometry, as fractions of the icon canvas.
+ *
+ * Kept here, away from anything that needs a `Canvas`, so the arithmetic below can be checked by a
+ * plain unit test rather than only by looking at a phone.
+ */
+object BadgeGeometry {
+    /** How far the badge's centre sits from the icon's, along each axis. */
+    const val OFFSET = 0.155f
+    const val RADIUS = 0.100f
+
+    /** A transparent ring around the badge, so it separates from whatever it lands on. */
+    const val GAP = 0.024f
+
+    /**
+     * What a circular adaptive mask keeps: an icon is authored at 108dp and masked to its central
+     * 72dp, so the mask is a disc of radius 36/108 around the centre.
+     */
+    const val MASK_RADIUS = 1f / 3f
+}
+
+/**
+ * Which corner of the icon the badge is drawn in.
+ *
+ * The offsets put the badge's centre [BadgeGeometry.OFFSET]·√2 = 0.219 of the canvas away from the
+ * icon's, which leaves its 0.100 radius inside the 0.333 mask with 0.014 to spare — about 6px of
+ * the 432px layer. That margin is what makes all four corners equally safe: a launcher with a
+ * circular mask, which is the strictest one in use, still shows the badge whole.
+ */
+@Serializable
+enum class BadgeCorner(val label: String, val x: Float, val y: Float) {
+    TOP_LEFT("Top left", 0.5f - BadgeGeometry.OFFSET, 0.5f - BadgeGeometry.OFFSET),
+    TOP_RIGHT("Top right", 0.5f + BadgeGeometry.OFFSET, 0.5f - BadgeGeometry.OFFSET),
+    BOTTOM_LEFT("Bottom left", 0.5f - BadgeGeometry.OFFSET, 0.5f + BadgeGeometry.OFFSET),
+    BOTTOM_RIGHT("Bottom right", 0.5f + BadgeGeometry.OFFSET, 0.5f + BadgeGeometry.OFFSET),
+}
+
 @Serializable
 enum class SourceKind { INSTALLED, FILE }
 
@@ -70,7 +107,7 @@ class IconImages(
  */
 fun interface IconRenderer {
     /** Null when the source app's icon could not be rendered, which is not fatal to a build. */
-    fun render(source: SourceApks, badge: String): IconImages?
+    fun render(source: SourceApks, badge: String, corner: BadgeCorner): IconImages?
 }
 
 /** Everything the user chose before the build starts. */
@@ -80,6 +117,7 @@ data class CloneRequest(
     val identityId: String,
     val iconMode: IconMode,
     val badgeText: String,
+    val badgeCorner: BadgeCorner,
     val deepRename: Boolean,
     val renameIntentActions: Boolean,
     val cloneIndex: Int,
@@ -99,6 +137,8 @@ data class CloneRecord(
     val identityLabel: String,
     val iconMode: IconMode,
     val badgeText: String,
+    /** Defaulted, because clones recorded before the corner could be chosen have no field for it. */
+    val badgeCorner: BadgeCorner = BadgeCorner.BOTTOM_RIGHT,
     val deepRename: Boolean,
     val renameIntentActions: Boolean,
     val cloneIndex: Int,
@@ -114,6 +154,7 @@ data class CloneRecord(
         identityId = identityId,
         iconMode = iconMode,
         badgeText = badgeText,
+        badgeCorner = badgeCorner,
         deepRename = deepRename,
         renameIntentActions = renameIntentActions,
         cloneIndex = cloneIndex,

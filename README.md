@@ -1,9 +1,9 @@
 # App Cloner
 
-Clones an Android app on the device: gives it a new name and package, optionally a badged icon,
-re-signs it with a key you control, and installs or exports the result. It then remembers where the
-clone came from, so it can tell you when the original has been updated and rebuild the clone from
-the new version.
+Clones an Android app on the device: gives it a new name and package, optionally a badged icon in
+the corner of your choosing, re-signs it with a key you control, and installs or exports the
+result. It then remembers where the clone came from, so it can tell you when the original has been
+updated, rebuild the clone from the new version, or rebuild it with different settings.
 
 Signing is the same machinery as [apk-signer](https://github.com/miron404/apk-signer): multiple
 identities, private keys sealed behind the Titan M2 secure element, and Google's `apksig` for the
@@ -65,6 +65,17 @@ an icon resource is usually referenced from a notification or an about screen as
 launcher's view of it is repointed, including any launcher activity that declares an
 `android:icon` of its own — otherwise the launcher shows the unbadged original.
 
+The badge goes in whichever **corner** you pick. All four are equally safe, and that is arithmetic
+rather than taste: an adaptive icon is authored at 108dp and a launcher only ever shows the central
+72dp, so the strictest mask in use — the circular one — keeps a disc of radius 0.333 of the canvas.
+Each corner puts the badge's centre 0.155·√2 = 0.219 out, leaving its 0.100 radius inside that disc
+with 0.014 to spare, about 6px of the 432px layer. `BadgeGeometryTest` checks it, because a corner
+that fails this looks fine on the phone it was drawn on and gets clipped on the next one.
+
+The form previews both results as you change them: the icon as a launcher will draw it, and the
+monochrome layer alone, tinted — which is the whole point of the cut-out and the case worth seeing
+before building rather than after installing.
+
 "Keep the original" is always available and is the option that cannot go wrong.
 
 ## Deep rename (off by default)
@@ -114,6 +125,14 @@ Rebuilding replays the same choices — name, package, icon, identity, deep rena
 version. Because the signing key is the same, installing the result **updates** the existing clone
 and its data survives.
 
+"Change settings and rebuild" opens the same form on an existing clone with its own settings filled
+in, so anything can be reconsidered later: the badge and its corner, whether the icon is touched at
+all, the deep rename, the name, the signing identity. The source is read again from scratch — the
+APKs this app produced are output, never input — so a clone built from a file that is no longer
+installed asks for that file again, and only accepts the same package. Keeping the package name
+makes the result an update of the clone on the device; changing it makes a second app, tracked as a
+clone of its own, and the form says which of the two is about to happen.
+
 This needs `QUERY_ALL_PACKAGES` to see other apps at all. There is still no `INTERNET` permission:
 everything compared here is read locally.
 
@@ -138,7 +157,8 @@ one that produced it:
 | `RewriteApkTest` | The renamed APK's package is what the platform's own manifest parser reports, no component name is left relative, and the result still signs and verifies. |
 | `RewriteApkTest` (dex) | A dex whose string pool was rewritten can be parsed again — which is the real check, since an unsorted string table or a stale offset makes it unreadable — and that class names and type descriptors came through untouched. |
 | `IconInjectionTest` | The hand-built `<adaptive-icon>` document round-trips through the parser, the manifest's icon id resolves to an entry carrying both configurations, and each layer references a drawable that was actually added. |
-| `ClonePipelineTest` | A whole build in the right order: renamed, re-iconed, signed, and accepted by `ApkVerifier` as the identity that signed it. |
+| `ClonePipelineTest` | A whole build in the right order: renamed, re-iconed, signed, and accepted by `ApkVerifier` as the identity that signed it, with the badge in the corner the request asked for. |
+| `BadgeGeometryTest` | Every badge corner leaves the badge inside a circular mask, and a clone recorded before the corner was a setting still decodes — which matters because the registry treats a decoding failure as an empty file. |
 
 What no test here covers is the last step: a clone actually installing and running on a device.
 `PackageInstaller` needs a real user confirming a real dialog, so that is the part to try by hand.

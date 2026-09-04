@@ -67,7 +67,7 @@ class ClonePipeline(private val icons: IconRenderer) {
         // icon's own resources still are.
         val images = if (request.iconMode == IconMode.BADGE) {
             onProgress(CloneProgress("Rendering icon"))
-            icons.render(source, request.badgeText).also {
+            icons.render(source, request.badgeText, request.badgeCorner).also {
                 if (it == null) {
                     warnings += "The source app's icon could not be rendered, so it was left " +
                         "as it is."
@@ -132,7 +132,8 @@ class ClonePipeline(private val icons: IconRenderer) {
                             ManifestRewriter.setIcon(manifest, resourceId)
                         }
                         if (applied.isSuccess) {
-                            iconSummary = "badged '${request.badgeText}'" +
+                            iconSummary = "badged '${request.badgeText}', " +
+                                request.badgeCorner.label.lowercase() +
                                 if (images.monochrome == null) {
                                     ", no themed layer in the original"
                                 } else {

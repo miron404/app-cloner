@@ -78,7 +78,11 @@ fun SourcePickerScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Choose an app") },
+                title = {
+                    Text(
+                        if (state.pendingEdit != null) "Find the source again" else "Choose an app"
+                    )
+                },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -92,6 +96,17 @@ fun SourcePickerScreen(
                 Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
+                state.pendingEdit?.let { pending ->
+                    SectionCard("Rebuilding ${pending.cloneLabel}") {
+                        Text(
+                            "A rebuild starts from the source app, not from the APKs this app " +
+                                "produced, and ${pending.source.label} is not installed. Pick its " +
+                                "APKs — the same package, ${pending.source.packageName} — to carry " +
+                                "on.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
                 OutlinedTextField(
                     value = query,
                     onValueChange = { query = it },

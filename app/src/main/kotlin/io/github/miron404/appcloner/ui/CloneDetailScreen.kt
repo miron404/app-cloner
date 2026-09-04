@@ -35,11 +35,18 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.miron404.appcloner.clone.CloneStatus
+import io.github.miron404.appcloner.clone.IconMode
 
 /** One clone: where it came from, how it was made, and what can still be done with it. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun CloneDetailScreen(model: CloneViewModel, cloneId: String, onBack: () -> Unit) {
+fun CloneDetailScreen(
+    model: CloneViewModel,
+    cloneId: String,
+    onBack: () -> Unit,
+    onConfigure: () -> Unit,
+    onPickSource: () -> Unit,
+) {
     val state by model.state.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
     MessageEffect(state.message, state.error, snackbar, model::consumeMessage)
@@ -135,7 +142,15 @@ fun CloneDetailScreen(model: CloneViewModel, cloneId: String, onBack: () -> Unit
             SectionCard("Clone") {
                 LabeledValue("Package", record.clonePackage, monospace = true)
                 LabeledValue("Signed by", record.identityLabel)
-                LabeledValue("Icon", record.iconMode.label)
+                LabeledValue(
+                    "Icon",
+                    if (record.iconMode == IconMode.BADGE) {
+                        "${record.iconMode.label} · '${record.badgeText}' " +
+                            record.badgeCorner.label.lowercase()
+                    } else {
+                        record.iconMode.label
+                    },
+                )
                 LabeledValue(
                     "Deep rename",
                     if (record.deepRename) "on" else "off",
@@ -161,6 +176,20 @@ fun CloneDetailScreen(model: CloneViewModel, cloneId: String, onBack: () -> Unit
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text(if (status.updateAvailable) "Update from the new version" else "Rebuild")
+            }
+            OutlinedButton(
+                onClick = {
+                    // A rebuild reads the source again, so a clone made from a file this app no
+                    // longer holds has to be pointed back at it.
+                    when (model.reconfigure(record)) {
+                        Reconfigure.READY -> onConfigure()
+                        Reconfigure.NEEDS_SOURCE -> onPickSource()
+                    }
+                },
+                enabled = !state.building,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Change settings and rebuild")
             }
             OutlinedButton(
                 onClick = { model.install(record) },

@@ -2,9 +2,12 @@ package io.github.miron404.appcloner.ui
 
 import android.app.Application
 import android.net.Uri
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import io.github.miron404.appcloner.clone.ApkSources
+import io.github.miron404.appcloner.clone.BadgeCorner
 import io.github.miron404.appcloner.clone.CloneJobService
 import io.github.miron404.appcloner.clone.CloneJobs
 import io.github.miron404.appcloner.clone.CloneProgress
@@ -12,6 +15,8 @@ import io.github.miron404.appcloner.clone.CloneRecord
 import io.github.miron404.appcloner.clone.CloneReport
 import io.github.miron404.appcloner.clone.CloneRequest
 import io.github.miron404.appcloner.clone.CloneStatus
+import io.github.miron404.appcloner.clone.IconFactory
+import io.github.miron404.appcloner.clone.IconLayers
 import io.github.miron404.appcloner.clone.IconMode
 import io.github.miron404.appcloner.clone.InstalledApp
 import io.github.miron404.appcloner.clone.PackageNames
@@ -32,6 +37,23 @@ import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
+/**
+ * What the configured icon will look like, both ways round.
+ *
+ * [themed] is the monochrome layer alone, which is all a launcher draws when Material You themed
+ * icons are on — the case the badge is designed around, and the one worth seeing before building.
+ */
+data class IconPreview(val normal: ImageBitmap, val themed: ImageBitmap?)
+
+/** Whether [CloneViewModel.reconfigure] could open the form straight away. */
+enum class Reconfigure {
+    /** The source was found and the form is filled in with the clone's existing settings. */
+    READY,
+
+    /** The source is not installed, so the user has to point at its APKs again. */
+    NEEDS_SOURCE,
+}
+
 data class CloneUiState(
     val clones: List<CloneStatus> = emptyList(),
     val identities: List<IdentityMeta> = emptyList(),
@@ -41,6 +63,11 @@ data class CloneUiState(
     /** The app a new clone is being configured from. */
     val source: SourceApks? = null,
     val draft: CloneRequest? = null,
+    /** Set when the draft is changing an existing clone rather than describing a new one. */
+    val editing: CloneRecord? = null,
+    /** An edit waiting for the user to point at the source APKs again. */
+    val pendingEdit: CloneRecord? = null,
+    val preview: IconPreview? = null,
     val progress: CloneProgress? = null,
     val report: CloneReport? = null,
     /** Set once a build finishes, so the result screen can offer to install or export it. */
@@ -63,6 +90,10 @@ class CloneViewModel(application: Application) : AndroidViewModel(application) {
 
     private var job: Job? = null
 
+    /** The source app's icon, rasterised once so moving the badge does not re-read the APK. */
+    private var sourceLayers: IconLayers? = null
+    private var previewJob: Job? = null
+
     init {
         refresh()
     }
@@ -78,8 +109,28 @@ class CloneViewModel(application: Application) : AndroidViewModel(application) {
 
     fun consumeMessage() = _state.update { it.copy(message = null, error = null) }
 
-    fun clearResult() = _state.update {
-        it.copy(source = null, draft = null, report = null, built = null, progress = null)
+    fun clearResult() {
+        previewJob?.cancel()
+        sourceLayers?.recycle()
+        sourceLayers = null
+        _state.update {
+            it.copy(
+                source = null,
+                draft = null,
+                editing = null,
+                pendingEdit = null,
+                preview = null,
+                report = null,
+                built = null,
+                progress = null,
+            )
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        sourceLayers?.recycle()
+        sourceLayers = null
     }
 
     // --- choosing what to clone ---------------------------------------------------------------
@@ -98,39 +149,109 @@ class CloneViewModel(application: Application) : AndroidViewModel(application) {
     fun chooseInstalled(packageName: String) = run("Reading the app") {
         val app = ApkSources.find(getApplication(), packageName)
             ?: error("$packageName is no longer installed")
-        adopt(ApkSources.fromInstalled(app))
+        adopt(ApkSources.fromInstalled(app), editing = _state.value.pendingEdit)
     }
 
     fun chooseFiles(uris: List<Uri>) = run("Copying the APK") {
         val workDir = File(container.workRoot, UUID.randomUUID().toString())
-        adopt(ApkSources.stage(getApplication(), uris, workDir))
+        adopt(ApkSources.stage(getApplication(), uris, workDir), editing = _state.value.pendingEdit)
     }
 
-    /** Sets the source and fills the form with defaults derived from it. */
-    private fun adopt(source: SourceApks) {
+    /**
+     * Sets the source and fills the form.
+     *
+     * With [editing] given the form starts from that clone's own settings, so a rebuild changes
+     * only what the user touches; otherwise it starts from defaults derived from the source.
+     */
+    private fun adopt(source: SourceApks, editing: CloneRecord? = null) {
+        if (editing != null && editing.source.packageName != source.info.packageName) {
+            error(
+                "That is ${source.info.packageName}, but this clone was built from " +
+                    "${editing.source.packageName}"
+            )
+        }
         val index = PackageNames.nextIndex(source.info.packageName, registry.list())
         val identity = vault.list().firstOrNull()
         _state.update {
             it.copy(
                 source = source,
+                editing = editing,
+                pendingEdit = null,
                 report = null,
                 built = null,
-                draft = CloneRequest(
+                draft = editing?.toRequest() ?: CloneRequest(
                     label = "${source.info.label} $index",
                     packageName = PackageNames.suggest(source.info.packageName, index),
                     identityId = identity?.id.orEmpty(),
                     iconMode = IconMode.BADGE,
                     badgeText = index.toString(),
+                    badgeCorner = BadgeCorner.BOTTOM_RIGHT,
                     deepRename = false,
                     renameIntentActions = false,
                     cloneIndex = index,
                 ),
             )
         }
+        refreshPreview(reload = true)
     }
 
-    fun editDraft(edit: (CloneRequest) -> CloneRequest) = _state.update { state ->
-        state.copy(draft = state.draft?.let(edit))
+    fun editDraft(edit: (CloneRequest) -> CloneRequest) {
+        val before = _state.value.draft
+        _state.update { state -> state.copy(draft = state.draft?.let(edit)) }
+        val after = _state.value.draft
+        if (before != null && after != null && before.rendersDifferentlyTo(after)) {
+            refreshPreview(reload = false)
+        }
+    }
+
+    /** Whether two drafts would draw a different icon, which is the only reason to redraw one. */
+    private fun CloneRequest.rendersDifferentlyTo(other: CloneRequest) =
+        iconMode != other.iconMode ||
+            badgeText != other.badgeText ||
+            badgeCorner != other.badgeCorner
+
+    /**
+     * Redraws the icon preview.
+     *
+     * The source's own layers are rasterised once and kept, because the point of the preview is to
+     * make moving the badge feel immediate; only [reload] goes back to the APK. Every write to
+     * [sourceLayers] happens on the main dispatcher, which is what keeps two overlapping loads from
+     * treading on each other.
+     */
+    private fun refreshPreview(reload: Boolean) {
+        previewJob?.cancel()
+        val source = _state.value.source ?: return
+        previewJob = viewModelScope.launch {
+            if (reload) {
+                sourceLayers?.recycle()
+                sourceLayers = null
+                _state.update { it.copy(preview = null) }
+                sourceLayers = withContext(Dispatchers.IO) {
+                    val drawable =
+                        IconFactory.loadIcon(getApplication(), source.base, source.splits)
+                    drawable?.let { runCatching { IconFactory.toLayers(it) }.getOrNull() }
+                }
+            }
+            val layers = sourceLayers ?: return@launch
+            val draft = _state.value.draft ?: return@launch
+            val preview = withContext(Dispatchers.Default) {
+                val badged = if (draft.iconMode == IconMode.BADGE) {
+                    IconFactory.badge(layers, draft.badgeText, draft.badgeCorner)
+                } else {
+                    null
+                }
+                val shown = badged ?: layers
+                try {
+                    IconPreview(
+                        normal = IconFactory.flatten(shown).asImageBitmap(),
+                        themed = IconFactory.flattenMonochrome(shown)?.asImageBitmap(),
+                    )
+                } finally {
+                    badged?.recycle()
+                }
+            }
+            _state.update { it.copy(preview = preview) }
+        }
     }
 
     // --- building -----------------------------------------------------------------------------
@@ -145,7 +266,42 @@ class CloneViewModel(application: Application) : AndroidViewModel(application) {
         val state = _state.value
         val source = state.source ?: return
         val draft = state.draft ?: return
-        startBuild(source, draft, existing = null)
+        // Editing an existing clone but giving it a different package name makes a second app, not
+        // a new version of the first, so it gets a record of its own and the original stays listed.
+        val existing = state.editing?.takeIf { it.clonePackage == draft.packageName }
+        startBuild(source, draft, existing = existing)
+    }
+
+    /**
+     * Opens the form on an existing clone so its settings can be changed and it rebuilt.
+     *
+     * The source has to be read again either way — the built APKs are the output, not the input —
+     * so a clone made from a file the app no longer holds needs that file picked again. Whichever
+     * source is picked then has to be the same package: a rebuild of *this* clone is only a rebuild
+     * if it comes from the app the clone was made from.
+     */
+    fun reconfigure(record: CloneRecord): Reconfigure {
+        val app = ApkSources.find(getApplication(), record.source.packageName)
+        if (app == null) {
+            previewJob?.cancel()
+            sourceLayers?.recycle()
+            sourceLayers = null
+            _state.update {
+                it.copy(
+                    source = null,
+                    draft = null,
+                    editing = null,
+                    preview = null,
+                    report = null,
+                    built = null,
+                    pendingEdit = record,
+                    message = "${record.source.label} is not installed. Pick its APK to rebuild.",
+                )
+            }
+            return Reconfigure.NEEDS_SOURCE
+        }
+        adopt(ApkSources.fromInstalled(app), editing = record)
+        return Reconfigure.READY
     }
 
     /** Rebuilds an existing clone from whatever version of its source is installed now. */
@@ -219,6 +375,7 @@ class CloneViewModel(application: Application) : AndroidViewModel(application) {
                     identityLabel = identity.label,
                     iconMode = request.iconMode,
                     badgeText = request.badgeText,
+                    badgeCorner = request.badgeCorner,
                     deepRename = request.deepRename,
                     renameIntentActions = request.renameIntentActions,
                     cloneIndex = request.cloneIndex,

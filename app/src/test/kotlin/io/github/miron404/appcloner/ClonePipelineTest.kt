@@ -1,6 +1,7 @@
 package io.github.miron404.appcloner
 
 import com.reandroid.apk.ApkModule
+import io.github.miron404.appcloner.clone.BadgeCorner
 import io.github.miron404.appcloner.clone.CloneRequest
 import io.github.miron404.appcloner.clone.ClonePipeline
 import io.github.miron404.appcloner.clone.IconImages
@@ -58,6 +59,9 @@ class ClonePipelineTest {
         )
 
         assertTrue("the icon was not reported as badged", report.icon.contains("badged"))
+        // The corner the request asked for is what the report names, so a build cannot silently
+        // fall back to a default one.
+        assertTrue(report.icon, report.icon.contains("top left"))
         ApkModule.loadApkFile(output).use { module ->
             module.setLoadDefaultFramework(false)
             val manifest = requireNotNull(module.androidManifest)
@@ -94,11 +98,12 @@ class ClonePipelineTest {
             identityId = "unused",
             iconMode = IconMode.BADGE,
             badgeText = "2",
+            badgeCorner = BadgeCorner.TOP_LEFT,
             deepRename = deepRename,
             renameIntentActions = false,
             cloneIndex = 2,
         )
-        val pipeline = ClonePipeline { _, _ ->
+        val pipeline = ClonePipeline { _, _, _ ->
             IconImages(
                 foreground = "fg".toByteArray(),
                 background = "bg".toByteArray(),

@@ -45,16 +45,10 @@ object IconFactory {
     /** 108dp at xxxhdpi, the density an adaptive icon layer is authored at. */
     const val CANVAS = 432
 
-    /**
-     * Where the badge sits, as a fraction of the canvas.
-     *
-     * An adaptive icon is masked down to its central 72dp, so a circular mask keeps only a disc of
-     * radius 0.333·W around the centre. Offsetting the badge 0.165·W along both axes puts its
-     * centre 0.233·W out, which leaves its 0.10·W radius inside the mask with room to spare.
-     */
-    private const val BADGE_CENTRE = 0.665f
-    private const val BADGE_RADIUS = 0.100f
-    private const val BADGE_GAP = 0.024f
+    // Where the badge sits is [BadgeCorner]'s business; the arithmetic behind those numbers, and
+    // the proof that all four corners survive a circular mask, are in [BadgeGeometry].
+    private const val BADGE_RADIUS = BadgeGeometry.RADIUS
+    private const val BADGE_GAP = BadgeGeometry.GAP
 
     private const val BADGE_FILL = 0xFF2962FF.toInt()
     private const val BADGE_GLYPH = Color.WHITE
@@ -110,9 +104,10 @@ object IconFactory {
      * the background layer through it, and the monochrome layer gets the same ring plus a knocked
      * out glyph so the badge is still legible once the launcher tints it.
      */
-    fun badge(layers: IconLayers, text: String): IconLayers {
+    fun badge(layers: IconLayers, text: String, corner: BadgeCorner): IconLayers {
         val glyph = text.trim().take(2).ifEmpty { "2" }
-        val cx = CANVAS * BADGE_CENTRE
+        val cx = CANVAS * corner.x
+        val cy = CANVAS * corner.y
         val radius = CANVAS * BADGE_RADIUS
         val gap = CANVAS * BADGE_GAP
 
@@ -124,16 +119,16 @@ object IconFactory {
 
         val foreground = layers.foreground.mutableCopy()
         Canvas(foreground).apply {
-            drawCircle(cx, cx, radius + gap, clear)
-            drawCircle(cx, cx, radius, fill)
-            drawGlyph(this, glyph, cx, radius, textPaint(BADGE_GLYPH, glyph.length))
+            drawCircle(cx, cy, radius + gap, clear)
+            drawCircle(cx, cy, radius, fill)
+            drawGlyph(this, glyph, cx, cy, radius, textPaint(BADGE_GLYPH, glyph.length))
         }
 
         val monochrome = layers.monochrome?.mutableCopy()?.also { bitmap ->
             Canvas(bitmap).apply {
-                drawCircle(cx, cx, radius + gap, clear)
-                drawCircle(cx, cx, radius, opaque)
-                drawGlyph(this, glyph, cx, radius, textPaint(Color.WHITE, glyph.length).also {
+                drawCircle(cx, cy, radius + gap, clear)
+                drawCircle(cx, cy, radius, opaque)
+                drawGlyph(this, glyph, cx, cy, radius, textPaint(Color.WHITE, glyph.length).also {
                     it.xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR)
                 })
             }
@@ -147,15 +142,32 @@ object IconFactory {
      * cropped to the region a mask always keeps so nothing important is lost off the edges.
      */
     fun flatten(layers: IconLayers): Bitmap {
+        val composed = Bitmap.createBitmap(CANVAS, CANVAS, Bitmap.Config.ARGB_8888)
+        Canvas(composed).apply {
+            drawBitmap(layers.background, 0f, 0f, null)
+            drawBitmap(layers.foreground, 0f, 0f, null)
+        }
+        return try {
+            crop(composed)
+        } finally {
+            composed.recycle()
+        }
+    }
+
+    /**
+     * The themed layer on its own, cropped the same way.
+     *
+     * This is what a launcher tints and draws when themed icons are on, so it is the honest way to
+     * show what the badge will look like there. Null when the icon has no themed layer.
+     */
+    fun flattenMonochrome(layers: IconLayers): Bitmap? = layers.monochrome?.let(::crop)
+
+    /** Masks a full 108dp layer down to the area an adaptive mask always keeps. */
+    private fun crop(source: Bitmap): Bitmap {
         val inset = CANVAS / 6f // 18dp of 108dp on each side
         val size = (CANVAS - 2 * inset).toInt()
         val out = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(out)
-        val rounded = Bitmap.createBitmap(CANVAS, CANVAS, Bitmap.Config.ARGB_8888)
-        Canvas(rounded).apply {
-            drawBitmap(layers.background, 0f, 0f, null)
-            drawBitmap(layers.foreground, 0f, 0f, null)
-        }
         val clip = Paint(Paint.ANTI_ALIAS_FLAG)
         canvas.drawRoundRect(
             RectF(0f, 0f, size.toFloat(), size.toFloat()),
@@ -164,8 +176,7 @@ object IconFactory {
             clip,
         )
         clip.xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_IN)
-        canvas.drawBitmap(rounded, -inset, -inset, clip)
-        rounded.recycle()
+        canvas.drawBitmap(source, -inset, -inset, clip)
         return out
     }
 
@@ -183,7 +194,14 @@ object IconFactory {
         textSize = CANVAS * BADGE_RADIUS * if (characters > 1) 1.05f else 1.35f
     }
 
-    private fun drawGlyph(canvas: Canvas, text: String, centre: Float, radius: Float, paint: Paint) {
+    private fun drawGlyph(
+        canvas: Canvas,
+        text: String,
+        x: Float,
+        y: Float,
+        radius: Float,
+        paint: Paint,
+    ) {
         // Centre on the glyph's own extents rather than the baseline, which sits low.
         val offset = (paint.descent() + paint.ascent()) / 2f
         var size = paint.textSize
@@ -191,7 +209,7 @@ object IconFactory {
             size -= 2f
             paint.textSize = size
         }
-        canvas.drawText(text, centre, centre - offset, paint)
+        canvas.drawText(text, x, y - offset, paint)
     }
 
     private fun rasterise(drawable: Drawable?): Bitmap? {
@@ -268,11 +286,11 @@ object IconFactory {
  */
 class AndroidIconRenderer(private val context: Context) : IconRenderer {
 
-    override fun render(source: SourceApks, badge: String): IconImages? {
+    override fun render(source: SourceApks, badge: String, corner: BadgeCorner): IconImages? {
         val drawable = IconFactory.loadIcon(context, source.base, source.splits) ?: return null
         val original = IconFactory.toLayers(drawable)
         val badged = try {
-            IconFactory.badge(original, badge)
+            IconFactory.badge(original, badge, corner)
         } finally {
             original.recycle()
         }

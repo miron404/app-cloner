@@ -55,7 +55,12 @@ fun AppNavHost(vaultModel: VaultViewModel, cloneModel: CloneViewModel) {
         composable(Routes.CLONES) {
             ClonesScreen(
                 model = cloneModel,
-                onNew = { navController.navigate(Routes.PICK) },
+                // A new clone starts from nothing, including from no half-finished edit of an
+                // existing one.
+                onNew = {
+                    cloneModel.clearResult()
+                    navController.navigate(Routes.PICK)
+                },
                 onOpen = { id -> navController.navigate("${Routes.DETAIL}/$id") },
                 onIdentities = { navController.navigate(Routes.IDENTITIES) },
             )
@@ -69,7 +74,10 @@ fun AppNavHost(vaultModel: VaultViewModel, cloneModel: CloneViewModel) {
                         popUpTo(Routes.PICK) { inclusive = true }
                     }
                 },
-                onBack = { navController.popBackStack() },
+                onBack = {
+                    cloneModel.clearResult()
+                    navController.popBackStack()
+                },
             )
         }
         composable(Routes.CONFIGURE) {
@@ -85,6 +93,8 @@ fun AppNavHost(vaultModel: VaultViewModel, cloneModel: CloneViewModel) {
                 model = cloneModel,
                 cloneId = entry.arguments?.getString("id").orEmpty(),
                 onBack = { navController.popBackStack() },
+                onConfigure = { navController.navigate(Routes.CONFIGURE) },
+                onPickSource = { navController.navigate(Routes.PICK) },
             )
         }
         composable(Routes.IDENTITIES) {
