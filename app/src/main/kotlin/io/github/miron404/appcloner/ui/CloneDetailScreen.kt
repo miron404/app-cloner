@@ -46,6 +46,7 @@ fun CloneDetailScreen(
     onBack: () -> Unit,
     onConfigure: () -> Unit,
     onPickSource: () -> Unit,
+    onOpenBuild: () -> Unit,
 ) {
     val state by model.state.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
@@ -170,12 +171,23 @@ fun CloneDetailScreen(
                 )
             }
 
+            // While something is building, this is the way back to it rather than a second
+            // build: only one runs at a time, and losing sight of the running one is worse than
+            // waiting for it.
             Button(
-                onClick = { model.rebuild(record) },
-                enabled = !state.building && status.sourcePresent,
+                onClick = {
+                    if (state.building) onOpenBuild() else if (model.rebuild(record)) onOpenBuild()
+                },
+                enabled = state.building || status.sourcePresent,
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text(if (status.updateAvailable) "Update from the new version" else "Rebuild")
+                Text(
+                    when {
+                        state.building -> "Go to the build in progress"
+                        status.updateAvailable -> "Update from the new version"
+                        else -> "Rebuild"
+                    }
+                )
             }
             OutlinedButton(
                 onClick = {
@@ -236,9 +248,4 @@ private fun UpdateBanner(status: CloneStatus) {
     SectionCard(if (status.updateAvailable) "Update available" else "Note") {
         Text(text, style = MaterialTheme.typography.bodySmall)
     }
-}
-
-@Composable
-private fun LaunchedBack(onBack: () -> Unit) {
-    androidx.compose.runtime.LaunchedEffect(Unit) { onBack() }
 }

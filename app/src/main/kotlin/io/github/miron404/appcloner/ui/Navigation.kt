@@ -16,6 +16,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
@@ -24,6 +25,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 
 object Routes {
     const val CLONES = "clones"
@@ -40,6 +43,25 @@ object Routes {
 fun AppNavHost(vaultModel: VaultViewModel, cloneModel: CloneViewModel) {
     val navController = rememberNavController()
     val vaultState by vaultModel.state.collectAsStateWithLifecycle()
+    // One screen shows a build, and everything that leads back to a running build leads here.
+    // Remembered rather than rebuilt: the graph below is keyed on the lambda that declares it, so
+    // handing it a new function on every recomposition would rebuild the whole graph.
+    val openBuild = remember(navController) {
+        { navController.navigate(Routes.CONFIGURE) { launchSingleTop = true } }
+    }
+
+    // The build notification asks for that screen from outside the navigation entirely. Only the
+    // one flag is collected here; the clone state changes on every progress tick, and this host
+    // has no reason to recompose that often.
+    val showBuild by remember(cloneModel) {
+        cloneModel.state.map { it.showBuild }.distinctUntilChanged()
+    }.collectAsStateWithLifecycle(initialValue = false)
+
+    LaunchedEffect(showBuild) {
+        if (!showBuild) return@LaunchedEffect
+        cloneModel.consumeBuildScreenRequest()
+        openBuild()
+    }
 
     // An APK opened with, or shared to, this app becomes the source for a new clone.
     LaunchedEffect(vaultState.incomingApk) {
@@ -63,6 +85,7 @@ fun AppNavHost(vaultModel: VaultViewModel, cloneModel: CloneViewModel) {
                 },
                 onOpen = { id -> navController.navigate("${Routes.DETAIL}/$id") },
                 onIdentities = { navController.navigate(Routes.IDENTITIES) },
+                onOpenBuild = openBuild,
             )
         }
         composable(Routes.PICK) {
@@ -95,6 +118,7 @@ fun AppNavHost(vaultModel: VaultViewModel, cloneModel: CloneViewModel) {
                 onBack = { navController.popBackStack() },
                 onConfigure = { navController.navigate(Routes.CONFIGURE) },
                 onPickSource = { navController.navigate(Routes.PICK) },
+                onOpenBuild = openBuild,
             )
         }
         composable(Routes.IDENTITIES) {

@@ -6,10 +6,9 @@ import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import io.github.miron404.appcloner.clone.ActiveBuild
 import io.github.miron404.appcloner.clone.ApkSources
 import io.github.miron404.appcloner.clone.BadgeCorner
-import io.github.miron404.appcloner.clone.CloneJobService
-import io.github.miron404.appcloner.clone.CloneJobs
 import io.github.miron404.appcloner.clone.CloneProgress
 import io.github.miron404.appcloner.clone.CloneRecord
 import io.github.miron404.appcloner.clone.CloneReport
@@ -63,6 +62,10 @@ data class CloneUiState(
     /** The app a new clone is being configured from. */
     val source: SourceApks? = null,
     val draft: CloneRequest? = null,
+    /** The build running now, which outlives this view model and every screen it was started from. */
+    val active: ActiveBuild? = null,
+    /** Set when something outside the navigation — the notification — asked for the build screen. */
+    val showBuild: Boolean = false,
     /** Set when the draft is changing an existing clone rather than describing a new one. */
     val editing: CloneRecord? = null,
     /** An edit waiting for the user to point at the source APKs again. */
@@ -76,7 +79,7 @@ data class CloneUiState(
     val message: String? = null,
     val error: String? = null,
 ) {
-    val building: Boolean get() = progress != null
+    val building: Boolean get() = active != null
 }
 
 class CloneViewModel(application: Application) : AndroidViewModel(application) {
@@ -84,18 +87,54 @@ class CloneViewModel(application: Application) : AndroidViewModel(application) {
     private val container = application.container
     private val vault = container.vault
     private val registry = container.registry
+    private val builds = container.builds
 
     private val _state = MutableStateFlow(CloneUiState())
     val state: StateFlow<CloneUiState> = _state.asStateFlow()
-
-    private var job: Job? = null
 
     /** The source app's icon, rasterised once so moving the badge does not re-read the APK. */
     private var sourceLayers: IconLayers? = null
     private var previewJob: Job? = null
 
+    /**
+     * A build belongs to the application, not to this view model, so its state is mirrored in
+     * rather than owned here. That is what lets the screen showing it be closed and reopened — or
+     * be rebuilt from nothing after the activity was destroyed — while the work carries on.
+     */
     init {
         refresh()
+        viewModelScope.launch {
+            builds.active.collect { active -> _state.update { it.copy(active = active) } }
+        }
+        viewModelScope.launch {
+            builds.progress.collect { progress -> _state.update { it.copy(progress = progress) } }
+        }
+        viewModelScope.launch {
+            builds.finished.collect { finished ->
+                _state.update { state ->
+                    state.copy(
+                        built = finished?.record,
+                        report = finished?.report,
+                        // Only worth re-reading when something was actually built.
+                        clones = if (finished == null) {
+                            state.clones
+                        } else {
+                            registry.statuses(getApplication())
+                        },
+                        message = finished?.let { "Built ${it.record.cloneLabel}" }
+                            ?: state.message,
+                    )
+                }
+            }
+        }
+        viewModelScope.launch {
+            builds.failure.collect { failure ->
+                if (failure != null) {
+                    _state.update { it.copy(error = failure) }
+                    builds.consumeFailure()
+                }
+            }
+        }
     }
 
     fun refresh() {
@@ -109,10 +148,15 @@ class CloneViewModel(application: Application) : AndroidViewModel(application) {
 
     fun consumeMessage() = _state.update { it.copy(message = null, error = null) }
 
+    /**
+     * Clears the form and the result of the last build, but never the build itself: leaving the
+     * screen is not cancelling, and there has to be something left to come back to.
+     */
     fun clearResult() {
         previewJob?.cancel()
         sourceLayers?.recycle()
         sourceLayers = null
+        builds.consumeFinished()
         _state.update {
             it.copy(
                 source = null,
@@ -122,7 +166,6 @@ class CloneViewModel(application: Application) : AndroidViewModel(application) {
                 preview = null,
                 report = null,
                 built = null,
-                progress = null,
             )
         }
     }
@@ -170,6 +213,8 @@ class CloneViewModel(application: Application) : AndroidViewModel(application) {
                     "${editing.source.packageName}"
             )
         }
+        // Choosing something to configure is the end of looking at the last result.
+        builds.consumeFinished()
         val index = PackageNames.nextIndex(source.info.packageName, registry.list())
         val identity = vault.list().firstOrNull()
         _state.update {
@@ -304,120 +349,67 @@ class CloneViewModel(application: Application) : AndroidViewModel(application) {
         return Reconfigure.READY
     }
 
-    /** Rebuilds an existing clone from whatever version of its source is installed now. */
-    fun rebuild(record: CloneRecord) {
+    /**
+     * Rebuilds an existing clone from whatever version of its source is installed now.
+     *
+     * @return true when a build was started, so the caller can show its screen.
+     */
+    fun rebuild(record: CloneRecord): Boolean {
         val app = ApkSources.find(getApplication(), record.source.packageName)
         if (app == null) {
             _state.update { it.copy(error = "${record.source.label} is not installed any more") }
-            return
+            return false
         }
-        startBuild(ApkSources.fromInstalled(app), record.toRequest(), existing = record)
+        return startBuild(ApkSources.fromInstalled(app), record.toRequest(), existing = record)
     }
 
-    private fun startBuild(source: SourceApks, request: CloneRequest, existing: CloneRecord?) {
-        if (job?.isActive == true) {
+    private fun startBuild(
+        source: SourceApks,
+        request: CloneRequest,
+        existing: CloneRecord?,
+    ): Boolean {
+        if (builds.running) {
             _state.update { it.copy(error = "A build is already running") }
-            return
+            return false
         }
         val identity = vault.list().firstOrNull { it.id == request.identityId }
         if (identity == null) {
             _state.update { it.copy(error = "Choose a signing identity first") }
-            return
+            return false
         }
         if (!PackageNames.isValid(request.packageName)) {
             _state.update { it.copy(error = "'${request.packageName}' is not a valid package name") }
-            return
+            return false
         }
         if (registry.list().any {
                 it.clonePackage == request.packageName && it.id != existing?.id
             }
         ) {
             _state.update { it.copy(error = "Another clone already uses that package name") }
-            return
+            return false
         }
 
-        val application = getApplication<Application>()
-        CloneJobService.start(application)
-        _state.update {
-            it.copy(
-                progress = CloneProgress("Starting"),
-                report = null,
-                built = null,
-                error = null,
-                message = null,
-            )
-        }
-
-        job = container.jobScope.launch {
-            val recordId = existing?.id ?: UUID.randomUUID().toString()
-            val outDir = File(container.outputRoot, recordId)
-            try {
-                outDir.deleteRecursively()
-                val report = vault.unlock(identity).use { unlocked ->
-                    container.pipeline.build(
-                        source = source,
-                        request = request,
-                        identity = unlocked,
-                        schemes = container.settings.defaultSchemes,
-                        outDir = outDir,
-                    ) { progress ->
-                        CloneJobs.publish(progress)
-                        _state.update { it.copy(progress = progress) }
-                    }
-                }
-
-                val record = CloneRecord(
-                    id = recordId,
-                    source = source.info,
-                    clonePackage = request.packageName,
-                    cloneLabel = request.label,
-                    identityId = identity.id,
-                    identityLabel = identity.label,
-                    iconMode = request.iconMode,
-                    badgeText = request.badgeText,
-                    badgeCorner = request.badgeCorner,
-                    deepRename = request.deepRename,
-                    renameIntentActions = request.renameIntentActions,
-                    cloneIndex = request.cloneIndex,
-                    createdAt = existing?.createdAt ?: System.currentTimeMillis(),
-                    builtAt = System.currentTimeMillis(),
-                    builtFromVersionCode = source.info.versionCode,
-                    builtFromVersionName = source.info.versionName,
-                )
-                registry.put(record)
-                _state.update {
-                    it.copy(
-                        progress = null,
-                        report = report,
-                        built = record,
-                        clones = registry.statuses(application),
-                        message = "Built ${record.cloneLabel}",
-                    )
-                }
-            } catch (_: AuthCancelledException) {
-                outDir.deleteRecursively()
-                _state.update { it.copy(progress = null, error = "Authentication cancelled") }
-            } catch (throwable: Throwable) {
-                outDir.deleteRecursively()
-                _state.update {
-                    it.copy(
-                        progress = null,
-                        error = throwable.message ?: throwable.javaClass.simpleName,
-                    )
-                }
-            } finally {
-                source.staging?.parentFile?.deleteRecursively()
-                CloneJobService.stop(application)
-            }
-        }
+        _state.update { it.copy(report = null, built = null, error = null, message = null) }
+        return builds.start(source, request, identity, existing)
     }
 
     fun cancelBuild() {
-        job?.cancel()
-        job = null
-        CloneJobService.stop(getApplication())
-        _state.update { it.copy(progress = null, message = "Build cancelled") }
+        builds.cancel()
+        _state.update { it.copy(message = "Build cancelled") }
     }
+
+    /**
+     * Asks the navigation host to show the running build, if there is one to show.
+     *
+     * Used by the notification, which is the way back into the app when the screen that started the
+     * build is long gone.
+     */
+    fun requestBuildScreen() {
+        if (builds.active.value == null && builds.finished.value == null) return
+        _state.update { it.copy(showBuild = true) }
+    }
+
+    fun consumeBuildScreenRequest() = _state.update { it.copy(showBuild = false) }
 
     // --- what to do with a finished clone ------------------------------------------------------
 

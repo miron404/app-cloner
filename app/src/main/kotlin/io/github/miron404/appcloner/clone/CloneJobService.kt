@@ -3,36 +3,30 @@ package io.github.miron404.appcloner.clone
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.IBinder
+import io.github.miron404.appcloner.MainActivity
+import io.github.miron404.appcloner.container
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-
-/** The single running build, shared between the view model and the foreground service. */
-object CloneJobs {
-    private val _progress = MutableStateFlow<CloneProgress?>(null)
-    val progress = _progress.asStateFlow()
-
-    fun publish(progress: CloneProgress?) {
-        _progress.value = progress
-    }
-}
 
 /**
  * Keeps the process alive while a clone is being built.
  *
  * Rewriting and signing a few hundred megabytes takes long enough that the user will put the phone
  * down, and a plain coroutine dies with the process. The service holds no key material and does no
- * work of its own: the pipeline runs in the application scope and this only publishes its progress
- * so the system has a reason to keep everything running.
+ * work of its own: the build runs in [BuildController] and this only mirrors its progress into a
+ * notification, so the system has a reason to keep everything running.
+ *
+ * Tapping that notification is one of the ways back to the build's own screen, which matters
+ * because the activity may well have been destroyed while the build carried on.
  */
 class CloneJobService : Service() {
 
@@ -49,7 +43,7 @@ class CloneJobService : Service() {
         createChannel()
         startForeground(
             NOTIFICATION_ID,
-            build(CloneJobs.progress.value),
+            build(container.builds.progress.value),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
         )
 
@@ -57,7 +51,7 @@ class CloneJobService : Service() {
             val created = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
             scope = created
             created.launch {
-                CloneJobs.progress.collect { progress ->
+                container.builds.progress.collect { progress ->
                     val manager = getSystemService(NotificationManager::class.java)
                     // Posting can be refused when notifications are turned off; the service and
                     // the build carry on regardless.
@@ -81,6 +75,7 @@ class CloneJobService : Service() {
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
+            .setContentIntent(showBuild())
             .apply {
                 val fraction = progress?.fraction
                 if (fraction != null) {
@@ -90,6 +85,19 @@ class CloneJobService : Service() {
                 }
             }
             .build()
+
+    /** Brings the app back to the screen for the build this notification is about. */
+    private fun showBuild(): PendingIntent {
+        val intent = Intent(this, MainActivity::class.java)
+            .setAction(MainActivity.ACTION_SHOW_BUILD)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        return PendingIntent.getActivity(
+            this,
+            0,
+            intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+    }
 
     private fun createChannel() {
         val manager = getSystemService(NotificationManager::class.java) ?: return
@@ -115,7 +123,6 @@ class CloneJobService : Service() {
         fun stop(context: Context) {
             val intent = Intent(context, CloneJobService::class.java).setAction(ACTION_STOP)
             runCatching { context.startService(intent) }
-            CloneJobs.publish(null)
         }
     }
 }

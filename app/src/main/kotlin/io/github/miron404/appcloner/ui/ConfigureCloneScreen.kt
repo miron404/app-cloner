@@ -62,9 +62,17 @@ import io.github.miron404.appcloner.clone.CloneRequest
 import io.github.miron404.appcloner.clone.IconMode
 import io.github.miron404.appcloner.clone.PackageNames
 import io.github.miron404.appcloner.clone.SourceApks
+import io.github.miron404.appcloner.clone.SourceInfo
 import io.github.miron404.appcloner.core.IdentityMeta
 
-/** Configures a clone, runs the build, and shows what came out of it. */
+/**
+ * Configures a clone, runs the build, and shows what came out of it.
+ *
+ * This is also the screen a build is watched on, and a build outlives the view model that started
+ * it: after the activity has been destroyed and rebuilt there is no draft and no chosen source any
+ * more, only what the running build carries. So everything drawn here falls back to that, and the
+ * screen is reachable from the clones list and from the notification, not only from the form.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ConfigureCloneScreen(model: CloneViewModel, onDone: () -> Unit) {
@@ -72,8 +80,8 @@ fun ConfigureCloneScreen(model: CloneViewModel, onDone: () -> Unit) {
     val snackbar = remember { SnackbarHostState() }
     MessageEffect(state.message, state.error, snackbar, model::consumeMessage)
 
-    val source = state.source
-    val draft = state.draft
+    val apks = state.source ?: state.active?.source
+    val info = apks?.info ?: state.built?.source
 
     Scaffold(
         topBar = {
@@ -81,6 +89,7 @@ fun ConfigureCloneScreen(model: CloneViewModel, onDone: () -> Unit) {
                 title = {
                     Text(
                         when {
+                            state.building -> "Building"
                             state.built != null -> "Clone ready"
                             state.editing != null -> "Rebuild"
                             else -> "New clone"
@@ -88,12 +97,13 @@ fun ConfigureCloneScreen(model: CloneViewModel, onDone: () -> Unit) {
                     )
                 },
                 navigationIcon = {
+                    // Leaving is allowed mid-build: the build carries on, and the clones list and
+                    // the notification both lead back here.
                     IconButton(
                         onClick = {
                             model.clearResult()
                             onDone()
                         },
-                        enabled = !state.building,
                     ) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
@@ -110,51 +120,60 @@ fun ConfigureCloneScreen(model: CloneViewModel, onDone: () -> Unit) {
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            if (source == null || draft == null) {
-                Text("Nothing selected.", style = MaterialTheme.typography.bodyMedium)
+            if (info == null) {
+                // Nothing chosen, nothing building, nothing built: there is no screen to draw.
+                LaunchedBack(onDone)
                 return@Column
             }
 
-            SourceHeader(source)
-
-            val editing = state.editing
-            if (editing != null && state.built == null) {
-                RebuildNote(editing, draft)
-            }
+            SourceHeader(info, apks)
 
             val built = state.built
             val report = state.report
+            val draft = state.draft
             when {
                 state.building -> BuildingCard(model, state)
                 built != null && report != null -> ResultCard(model, built, report)
-                else -> Form(model, state, draft)
+                draft != null -> {
+                    val editing = state.editing
+                    if (editing != null) RebuildNote(editing, draft)
+                    Form(model, state, draft)
+                }
+
+                else -> LaunchedBack(onDone)
             }
         }
     }
 }
 
+/**
+ * The app being cloned. [apks] is absent once only a finished build is left to describe it, which
+ * is where the file count and the size come from.
+ */
 @Composable
-private fun SourceHeader(source: SourceApks) {
+private fun SourceHeader(info: SourceInfo, apks: SourceApks?) {
     SectionCard("Source") {
         Row(
             horizontalArrangement = Arrangement.spacedBy(14.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            AppIcon(source.info.packageName)
+            AppIcon(info.packageName)
             Column {
-                Text(source.info.label, style = MaterialTheme.typography.titleSmall)
+                Text(info.label, style = MaterialTheme.typography.titleSmall)
                 Text(
-                    source.info.packageName,
+                    info.packageName,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Text(
                     buildString {
-                        append(source.info.versionName.ifBlank { "version ${source.info.versionCode}" })
-                        if (source.info.hasSplits) {
-                            append(" · base + ${source.splits.size} splits")
+                        append(info.versionName.ifBlank { "version ${info.versionCode}" })
+                        if (info.hasSplits) {
+                            append(" · base + ${info.splitNames.size} splits")
                         }
-                        append(" · %.0f MB".format(source.totalBytes / 1_000_000.0))
+                        if (apks != null) {
+                            append(" · %.0f MB".format(apks.totalBytes / 1_000_000.0))
+                        }
                     },
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -447,6 +466,12 @@ private fun PreviewTile(
 private fun BuildingCard(model: CloneViewModel, state: CloneUiState) {
     val progress = state.progress
     SectionCard(progress?.step ?: "Working") {
+        state.active?.let { active ->
+            Text(
+                "Building ${active.request.label} · ${active.request.packageName}",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        }
         val fraction = progress?.fraction
         if (fraction != null) {
             LinearProgressIndicator(progress = { fraction }, modifier = Modifier.fillMaxWidth())
@@ -462,7 +487,8 @@ private fun BuildingCard(model: CloneViewModel, state: CloneUiState) {
             )
         }
         Text(
-            "You can leave the app; the build keeps going and reports in the notification.",
+            "You can leave this screen, or the app. The build keeps going, and the clones list " +
+                "and the notification both lead back here.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

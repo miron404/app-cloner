@@ -2,8 +2,9 @@ package io.github.miron404.appcloner
 
 import android.app.Application
 import android.content.Context
-import io.github.miron404.appcloner.clone.CloneRegistry
 import io.github.miron404.appcloner.clone.AndroidIconRenderer
+import io.github.miron404.appcloner.clone.BuildController
+import io.github.miron404.appcloner.clone.CloneRegistry
 import io.github.miron404.appcloner.clone.ClonePipeline
 import io.github.miron404.appcloner.clone.Installer
 import io.github.miron404.appcloner.core.AppSettings
@@ -38,6 +39,20 @@ class AppContainer(context: Context) {
      * process around for as long as this scope has work in it.
      */
     val jobScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    /**
+     * The running build, kept here rather than in a view model so that leaving the screen — or the
+     * app — does not lose the way back to it.
+     */
+    val builds = BuildController(
+        context = context.applicationContext,
+        scope = jobScope,
+        vault = vault,
+        registry = registry,
+        pipeline = pipeline,
+        settings = settings,
+        outputRoot = outputRoot,
+    )
 }
 
 class AppClonerApplication : Application() {

@@ -114,6 +114,26 @@ no amount of rewriting fixes it:
 
 The app scans for the first two while it works and says so before you install.
 
+## A build outlives its screen
+
+Repacking and signing a large app takes minutes, and the user will leave. The work therefore runs
+in the application scope with a foreground service to keep the process, and — the part that is easy
+to get wrong — the state of the build lives in `BuildController`, in the application container,
+rather than in a view model. A view model dies with the activity; if the running build lived there,
+leaving the app would leave a build with no screen and no way back to one.
+
+So there are three ways back to a running build, and all of them lead to the same screen:
+
+- the card at the top of the clones list, which shows the current step and its progress;
+- the notification, which brings the app to that screen rather than to the list;
+- **Rebuild** on a clone's page, which while something is building says "Go to the build in
+  progress" and takes you there instead of queueing a second build.
+
+That screen redraws itself from the build alone, so it works after the activity has been destroyed
+and recreated, when there is no draft and no chosen source left anywhere. Leaving it does not
+cancel anything — only Cancel does. A build that finishes while you are elsewhere keeps its result
+until you have looked at it.
+
 ## Detecting updates
 
 A clone and its source are unrelated packages as far as the system is concerned, so nothing links
@@ -162,6 +182,8 @@ one that produced it:
 
 What no test here covers is the last step: a clone actually installing and running on a device.
 `PackageInstaller` needs a real user confirming a real dialog, so that is the part to try by hand.
+The same goes for leaving the app mid-build and finding the way back to it — that is Android
+lifecycle behaviour, not something a JVM test can stand in for.
 
 ### Release signing
 

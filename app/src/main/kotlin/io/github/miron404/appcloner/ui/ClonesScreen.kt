@@ -16,6 +16,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.Icon
@@ -52,6 +53,7 @@ fun ClonesScreen(
     onNew: () -> Unit,
     onOpen: (String) -> Unit,
     onIdentities: () -> Unit,
+    onOpenBuild: () -> Unit,
 ) {
     val state by model.state.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
@@ -91,6 +93,28 @@ fun ClonesScreen(
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
                 )
             }
+            // A build outlives the screen it was started from, so this is the way back to it —
+            // without it, leaving the app mid-build loses sight of the build entirely.
+            val active = state.active
+            val ready = state.built
+            if (active != null) {
+                BuildBanner(
+                    title = "Building ${active.request.label}",
+                    detail = state.progress?.step.orEmpty(),
+                    fraction = state.progress?.fraction,
+                    showProgress = true,
+                    onClick = onOpenBuild,
+                )
+            } else if (ready != null) {
+                BuildBanner(
+                    title = "${ready.cloneLabel} is ready",
+                    detail = "Install it or export it",
+                    fraction = null,
+                    showProgress = false,
+                    onClick = onOpenBuild,
+                )
+            }
+
             if (outdated > 0) {
                 Text(
                     if (outdated == 1) {
@@ -115,6 +139,51 @@ fun ClonesScreen(
                     }
                 }
             }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun BuildBanner(
+    title: String,
+    detail: String,
+    fraction: Float?,
+    showProgress: Boolean,
+    onClick: () -> Unit,
+) {
+    Card(
+        onClick = onClick,
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.primaryContainer,
+        ),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+    ) {
+        Column(
+            Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(title, style = MaterialTheme.typography.titleSmall)
+            if (detail.isNotBlank()) {
+                Text(detail, style = MaterialTheme.typography.bodySmall)
+            }
+            if (showProgress) {
+                if (fraction != null) {
+                    LinearProgressIndicator(
+                        progress = { fraction },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                } else {
+                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                }
+            }
+            Text(
+                "Tap to open",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }

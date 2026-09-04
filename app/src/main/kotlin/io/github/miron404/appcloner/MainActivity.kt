@@ -39,7 +39,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        acceptIncomingApk(intent)
+        acceptIntent(intent)
         requestNotificationPermission()
 
         setContent {
@@ -76,11 +76,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** The activity is `singleTask`, so a second APK arrives here rather than through onCreate. */
+    /**
+     * The activity is `singleTask`, so a second APK — or a tap on the build notification — arrives
+     * here rather than through onCreate.
+     */
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        acceptIncomingApk(intent)
+        acceptIntent(intent)
     }
 
     override fun onStart() {
@@ -107,7 +110,8 @@ class MainActivity : ComponentActivity() {
         if (!granted) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
 
-    private fun acceptIncomingApk(intent: Intent?) {
+    private fun acceptIntent(intent: Intent?) {
+        if (intent?.action == ACTION_SHOW_BUILD) cloneModel.requestBuildScreen()
         incomingApkUri(intent)?.let(vaultModel::onApkReceived)
     }
 
@@ -120,5 +124,10 @@ class MainActivity : ComponentActivity() {
         // Only a content:// URI carries a permission grant from the sender. Anything else is
         // either unreadable to us anyway or an attempt to point this app at its own storage.
         return uri.takeIf { it.scheme == ContentResolver.SCHEME_CONTENT }
+    }
+
+    companion object {
+        /** Sent by the build notification: show the build that is running rather than the list. */
+        const val ACTION_SHOW_BUILD = "io.github.miron404.appcloner.SHOW_BUILD"
     }
 }

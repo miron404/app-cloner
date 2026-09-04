@@ -16,6 +16,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -235,3 +236,9 @@ fun KeyValueRow(label: String, value: String) {
 private val dateFormat: DateFormat = DateFormat.getDateInstance(DateFormat.MEDIUM)
 
 fun formatDate(epochMillis: Long): String = dateFormat.format(Date(epochMillis))
+
+/** Leaves a screen that has nothing left to show, on the frame it notices. */
+@Composable
+fun LaunchedBack(onBack: () -> Unit) {
+    LaunchedEffect(Unit) { onBack() }
+}
