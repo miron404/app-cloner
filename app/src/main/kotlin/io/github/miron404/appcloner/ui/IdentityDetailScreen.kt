@@ -174,8 +174,3 @@ fun IdentityDetailScreen(model: VaultViewModel, identityId: String, onBack: () -
         }
     }
 }
-
-@Composable
-private fun LaunchedBack(onBack: () -> Unit) {
-    androidx.compose.runtime.LaunchedEffect(Unit) { onBack() }
-}
