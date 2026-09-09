@@ -181,6 +181,33 @@ class VaultTest {
         assertFalse(File(root, meta.id + ".meta.json").exists())
     }
 
+    /**
+     * The clone form and the vault screen are separate view models reading one vault, so the list
+     * has to arrive rather than be fetched. When it was fetched, an identity created on one screen
+     * stayed invisible to the other — and so unusable — until the app was restarted.
+     */
+    @Test
+    fun `every change to the vault is published to the identity flow`() = runTest {
+        vault.ensureMasterKey()
+        assertTrue("a fresh vault has nothing in it", vault.identities.value.isEmpty())
+
+        val alpha = vault.create(request("alpha"))
+        assertEquals(listOf(alpha.id), vault.identities.value.map { it.id })
+
+        val beta = vault.create(request("beta"))
+        assertEquals(listOf(alpha.id, beta.id), vault.identities.value.map { it.id })
+
+        // Renaming only the label skips the re-sealing path, so it is published from somewhere else.
+        vault.rename(beta, "aardvark", "")
+        assertEquals(
+            listOf("aardvark", "alpha"),
+            vault.identities.value.map { it.label },
+        )
+
+        vault.delete(alpha.id)
+        assertEquals(listOf(beta.id), vault.identities.value.map { it.id })
+    }
+
     @Test
     fun `rekey re-seals every identity under a new master key`() = runTest {
         vault.ensureMasterKey()

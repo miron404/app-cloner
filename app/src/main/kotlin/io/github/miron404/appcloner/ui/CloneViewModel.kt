@@ -103,6 +103,14 @@ class CloneViewModel(application: Application) : AndroidViewModel(application) {
      */
     init {
         refresh()
+        // The identity picker in the clone form draws from this. It is a flow because the vault
+        // is edited from a different screen with a different view model, and an identity created
+        // there has to be selectable here as soon as the user comes back — by whichever route.
+        viewModelScope.launch {
+            vault.identities.collect { identities ->
+                _state.update { it.copy(identities = identities) }
+            }
+        }
         viewModelScope.launch {
             builds.active.collect { active -> _state.update { it.copy(active = active) } }
         }
@@ -137,13 +145,9 @@ class CloneViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Re-reads the clones and what the package manager says about their sources. */
     fun refresh() {
-        _state.update {
-            it.copy(
-                clones = registry.statuses(getApplication()),
-                identities = vault.list(),
-            )
-        }
+        _state.update { it.copy(clones = registry.statuses(getApplication())) }
     }
 
     fun consumeMessage() = _state.update { it.copy(message = null, error = null) }
@@ -216,7 +220,7 @@ class CloneViewModel(application: Application) : AndroidViewModel(application) {
         // Choosing something to configure is the end of looking at the last result.
         builds.consumeFinished()
         val index = PackageNames.nextIndex(source.info.packageName, registry.list())
-        val identity = vault.list().firstOrNull()
+        val identity = vault.identities.value.firstOrNull()
         _state.update {
             it.copy(
                 source = source,
@@ -372,7 +376,7 @@ class CloneViewModel(application: Application) : AndroidViewModel(application) {
             _state.update { it.copy(error = "A build is already running") }
             return false
         }
-        val identity = vault.list().firstOrNull { it.id == request.identityId }
+        val identity = vault.identities.value.firstOrNull { it.id == request.identityId }
         if (identity == null) {
             _state.update { it.copy(error = "Choose a signing identity first") }
             return false

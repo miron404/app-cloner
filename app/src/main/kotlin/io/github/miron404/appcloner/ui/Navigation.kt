@@ -126,12 +126,7 @@ fun AppNavHost(vaultModel: VaultViewModel, cloneModel: CloneViewModel) {
                 model = vaultModel,
                 onCreate = { navController.navigate(Routes.CREATE) },
                 onOpen = { id -> navController.navigate("${Routes.IDENTITY}/$id") },
-                onBack = {
-                    // The clone form reads the identity list straight from the vault, so it has
-                    // to be told that creating or deleting one changed it.
-                    cloneModel.refresh()
-                    navController.popBackStack()
-                },
+                onBack = { navController.popBackStack() },
                 onSettings = { navController.navigate(Routes.SETTINGS) },
             )
         }

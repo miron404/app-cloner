@@ -57,12 +57,19 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         refresh()
+        // The vault owns the list; this screen only mirrors it, so creating or deleting an
+        // identity anywhere shows up here without anyone having to call refresh().
+        viewModelScope.launch {
+            vault.identities.collect { identities ->
+                _state.update { it.copy(identities = identities) }
+            }
+        }
     }
 
+    /** Re-reads the state that is not a flow. The identity list arrives on its own. */
     fun refresh() {
         _state.update {
             it.copy(
-                identities = vault.list(),
                 masterKey = vault.state(),
                 lockOnLaunch = settings.lockOnLaunch,
             )
@@ -169,13 +176,11 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
      */
     fun renameIdentity(meta: IdentityMeta, label: String, alias: String) = run("Renaming") {
         val updated = vault.rename(meta, label, alias)
-        refresh()
         _state.update { it.copy(message = "Renamed to ${updated.label}") }
     }
 
     fun deleteIdentity(meta: IdentityMeta) = run("Deleting") {
         vault.delete(meta.id)
-        refresh()
         _state.update { it.copy(message = "Deleted ${meta.label}") }
     }
 
@@ -239,6 +244,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                 portables.forEach { portable ->
                     if (vault.restore(portable, overwrite)) added++ else skipped++
                 }
+                // For the master key the import may have just created; identities arrive on their own.
                 refresh()
                 _state.update {
                     it.copy(

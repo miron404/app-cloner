@@ -1,6 +1,9 @@
 package io.github.miron404.appcloner.core
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
@@ -67,6 +70,19 @@ class Vault(
 ) {
     private val json = Json { ignoreUnknownKeys = true; prettyPrint = false }
     private val root = root.apply { mkdirs() }
+
+    private val _identities = MutableStateFlow(list())
+
+    /**
+     * The identities on disk, as a flow rather than something each screen reads once.
+     *
+     * Two view models show this list and either can change it, so a snapshot taken when a screen
+     * opened goes stale the moment the other one writes. Copying it across on a navigation callback
+     * only works for the exits that have a callback: leave the identity screen with the system back
+     * gesture instead of the arrow and the clone form still believes the vault is as it was, which
+     * is how a freshly created identity used to stay unusable until the app was restarted.
+     */
+    val identities: StateFlow<List<IdentityMeta>> = _identities.asStateFlow()
 
     /** Resumes an interrupted rekey and clears stray state. Safe to call repeatedly. */
     fun repair() {
@@ -197,8 +213,13 @@ class Vault(
         }
     }
 
+    /**
+     * The one place identity metadata reaches the disk, and therefore the one place [identities]
+     * has to be republished from: create, restore and both halves of rename all land here.
+     */
     private fun writeMeta(meta: IdentityMeta) {
         File(root, meta.id + META_SUFFIX).writeText(json.encodeToString(meta))
+        _identities.value = list()
     }
 
     private suspend fun store(meta: IdentityMeta, password: CharArray, pkcs12: ByteArray) {
@@ -246,6 +267,7 @@ class Vault(
     fun delete(id: String) {
         File(root, id + KEY_SUFFIX).delete()
         File(root, id + META_SUFFIX).delete()
+        _identities.value = list()
     }
 
     /**
