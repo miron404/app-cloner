@@ -120,29 +120,33 @@ object DexRewriter {
     fun estimateModelHeap(dexBytes: Long): Long = dexBytes * MODEL_HEAP_FACTOR
 
     /**
-     * Whether a dex of [dexBytes] can be rebuilt with [availableHeap] bytes to hand.
+     * Whether a dex of [dexBytes] can be rebuilt at all where the heap tops out at [heapLimit].
      *
-     * A size of zero means the archive did not say, in which case this cannot judge and says yes:
-     * the caller still has the out-of-memory guard behind it.
+     * The question is deliberately asked against the ceiling rather than against what happens to be
+     * free at the time. A model that has just been released is garbage that still counts as used
+     * until something collects it, so "free right now" reads far lower than what the next
+     * allocation can actually have — measuring that way refused a dex the previous run of this very
+     * loop had just proved there was room for.
+     *
+     * A size of zero means the archive did not declare one, in which case this cannot judge and
+     * says yes: the out-of-memory guard behind it is what catches the miss.
      */
-    fun fitsInHeap(dexBytes: Long, availableHeap: Long): Boolean =
-        dexBytes <= 0 || estimateModelHeap(dexBytes) + HEAP_RESERVE <= availableHeap
+    fun fitsInHeap(dexBytes: Long, heapLimit: Long): Boolean =
+        dexBytes <= 0 || estimateModelHeap(dexBytes) + HEAP_RESERVE <= heapLimit
 
-    /** Heap still unspent: what the limit allows, less what is already held. */
-    fun availableHeap(): Long = Runtime.getRuntime().let { runtime ->
-        runtime.maxMemory() - runtime.totalMemory() + runtime.freeMemory()
-    }
+    /** The most heap this process will ever be given. */
+    fun heapLimit(): Long = Runtime.getRuntime().maxMemory()
 
     /**
      * Why a dex cannot be rewritten here, phrased for someone who has to decide what to do about
      * it. Deep rename is the only thing that needs this, and turning it off is always available.
      */
-    fun tooLargeMessage(dexName: String, apkName: String, dexBytes: Long, availableHeap: Long) =
+    fun tooLargeMessage(dexName: String, apkName: String, dexBytes: Long, heapLimit: Long) =
         "$dexName in $apkName is ${megabytes(dexBytes)}, and rebuilding its string pool needs " +
-            "about ${megabytes(estimateModelHeap(dexBytes))} of heap — there is " +
-            "${megabytes(availableHeap)} free of the ${megabytes(Runtime.getRuntime().maxMemory())} " +
-            "this device allows one app. Turn deep rename off to clone this app: the package is " +
-            "still renamed everywhere the manifest declares it, which is all most apps need."
+            "about ${megabytes(estimateModelHeap(dexBytes))} of heap. The most this device gives " +
+            "one app is ${megabytes(heapLimit)}, and some of that has to stay free for the screen. " +
+            "Turn deep rename off to clone this app: the package is still renamed everywhere the " +
+            "manifest declares it, which is all most apps need."
 
     private fun megabytes(bytes: Long) = "%.0f MB".format(bytes / 1048576.0)
 }

@@ -27,6 +27,16 @@ class DexHeapBudgetTest {
         )
     }
 
+    /**
+     * The one that has to keep working: a dex small enough for a phone is not refused. Ten
+     * megabytes is the size of the smaller dexes in this app's own debug build, and refusing those
+     * would have made deep rename useless rather than merely limited.
+     */
+    @Test
+    fun `a dex a phone can manage is allowed`() {
+        assertTrue(DexRewriter.fitsInHeap(10 * megabyte, 512 * megabyte))
+    }
+
     /** And the CI case, so the pipeline test that does a real deep rename still runs. */
     @Test
     fun `the same dex fits in the heap the tests are given`() {
@@ -60,12 +70,13 @@ class DexHeapBudgetTest {
             dexName = "classes.dex",
             apkName = "base.apk",
             dexBytes = 42 * megabyte,
-            availableHeap = 300 * megabyte,
+            heapLimit = 512 * megabyte,
         )
 
         assertTrue(message, message.contains("classes.dex"))
         assertTrue(message, message.contains("base.apk"))
         assertTrue(message, message.contains("42 MB"))
         assertTrue(message, message.contains("deep rename"))
+        assertTrue(message, message.contains("512 MB"))
     }
 }

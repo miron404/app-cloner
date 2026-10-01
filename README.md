@@ -107,16 +107,24 @@ rebuilding it does not fit in the 512 MB a JVM gets by default, which is why the
 it asks for 2 GB.
 
 A phone gives one app 512 MB with `largeHeap` on, and no more. So deep rename is budgeted rather
-than attempted: the largest dex is measured against the heap actually free, with room kept back for
-everything that is not the rewrite, and an app that cannot fit is refused **before** the indexing
-pass with a message saying how big the dex is and how much it would have needed. Being refused in a
-second is the point — the alternative is finding out by exhausting the heap, and an
-`OutOfMemoryError` lands on whichever thread allocates next, which is often the one drawing the
-screen. That kills the process and loses the whole build, not just the rewrite.
+than attempted: the largest dex is weighed against that ceiling, with room kept back for everything
+which is not the rewrite, and an app that cannot fit is refused **before** the indexing pass — which
+is itself a read of every dex in the app — with a message saying how big the dex is and how much it
+would have needed. Being refused in a second is the point. The alternative is finding out by
+exhausting the heap, and an `OutOfMemoryError` is thrown on whichever thread happens to allocate
+next, which is often the one drawing the screen: that kills the process and loses the whole build,
+not just the rewrite.
 
-The reserve matters for the same reason. Leaving the app mid-build and coming back is the normal
-case, and a recreated activity rebuilds the entire Compose tree; on a heap with nothing spare, that
-is the allocation that throws.
+The test is against the ceiling and not against free space on purpose. A model that has just been
+released is garbage that still counts as used until something collects it, so "free right now" reads
+far lower than what the next allocation can really have — measured that way, the ninth dex of this
+app's own debug build is refused on memory the first dex had just finished proving was there. What
+the loop does instead is ask for a collection between dexes, so the previous model is actually gone
+before the next one is built.
+
+The reserve exists for the case that was reported: leaving the app mid-build and coming back is
+normal, and a recreated activity rebuilds the entire Compose tree. On a heap with nothing spare,
+that is the allocation that throws.
 
 The manifest rename needs none of this and is never refused.
 
