@@ -57,6 +57,10 @@ class ClonePipeline(private val icons: IconRenderer) {
         // Every dex in the app is indexed before any of them is edited: a string naming a class
         // that lives in a different dex still has to be left alone.
         val classIndex = if (request.deepRename) {
+            // Asked before the indexing pass, which reads every dex in the app: there is no point
+            // spending that on a rewrite the heap cannot hold. The same question is asked again at
+            // the moment of each rewrite, when the answer is exact.
+            requireRoomForDeepRename(source.all)
             onProgress(CloneProgress("Indexing classes", "so reflection keeps working"))
             buildClassIndex(source.all, oldPackage)
         } else {
@@ -113,6 +117,7 @@ class ClonePipeline(private val icons: IconRenderer) {
                     if (classIndex != null) {
                         val result = rewriteDex(
                             module = module,
+                            apk = apk,
                             oldPackage = oldPackage,
                             newPackage = newPackage,
                             index = classIndex,
@@ -217,6 +222,7 @@ class ClonePipeline(private val icons: IconRenderer) {
      */
     private fun rewriteDex(
         module: ApkModule,
+        apk: File,
         oldPackage: String,
         newPackage: String,
         index: DexRewriter.ClassIndex,
@@ -226,13 +232,33 @@ class ClonePipeline(private val icons: IconRenderer) {
         var files = 0
         var changed = 0
         var skipped = 0
+        val sizes = dexSizes(apk)
         for (name in dexEntryNames(module)) {
             val source = module.zipEntryMap.getInputSource(name) ?: continue
             files++
             val method = source.method
             val output = File(scratch, "$prefix-$name")
-            val result = source.openStream().use { stream ->
-                DexRewriter.rewrite(stream, oldPackage, newPackage, index, output)
+            // Now is when the answer is exact: the resource table of this APK and the class index
+            // are already held, so what is free here is what the rewrite really has to work in.
+            val size = sizes[name] ?: 0L
+            val available = DexRewriter.availableHeap()
+            if (!DexRewriter.fitsInHeap(size, available)) {
+                throw IllegalStateException(
+                    DexRewriter.tooLargeMessage(name, apk.name, size, available)
+                )
+            }
+            val result = try {
+                source.openStream().use { stream ->
+                    DexRewriter.rewrite(stream, oldPackage, newPackage, index, output)
+                }
+            } catch (error: OutOfMemoryError) {
+                // The estimate above was optimistic. Say so and stop, rather than leaving the
+                // process to die on whichever thread allocates next — which may well be the one
+                // drawing the screen, and then the whole build is lost with it.
+                throw IllegalStateException(
+                    DexRewriter.tooLargeMessage(name, apk.name, size, available),
+                    error,
+                )
             }
             changed += result.changed
             skipped += result.skipped
@@ -251,6 +277,34 @@ class ClonePipeline(private val icons: IconRenderer) {
             .map { if (it == 1) "classes.dex" else "classes$it.dex" }
             .takeWhile { module.zipEntryMap.contains(it) }
             .toList()
+
+    /** Uncompressed sizes of the dex entries in [apk], read from the archive's central directory. */
+    private fun dexSizes(apk: File): Map<String, Long> =
+        ZipFile(apk).use { zip ->
+            zip.entries().asSequence()
+                .filter { !it.isDirectory && DexRewriter.isDexEntry(it.name) }
+                .associate { it.name to it.size.coerceAtLeast(0L) }
+        }
+
+    /**
+     * Refuses a deep rename whose largest dex cannot be rebuilt in the heap this device allows.
+     *
+     * The limit is real and not generous: a phone gives one app a few hundred megabytes even when
+     * it asks for a large heap, and the object model for a dex is many times the size of the file.
+     * Finding that out by running out of memory costs the user the whole build and, as often as
+     * not, the process; finding it out here costs a second.
+     */
+    private fun requireRoomForDeepRename(apks: List<File>) {
+        val available = DexRewriter.availableHeap()
+        for (apk in apks) {
+            val largest = dexSizes(apk).maxByOrNull { it.value } ?: continue
+            if (!DexRewriter.fitsInHeap(largest.value, available)) {
+                throw IllegalStateException(
+                    DexRewriter.tooLargeMessage(largest.key, apk.name, largest.value, available)
+                )
+            }
+        }
+    }
 
     private fun buildClassIndex(apks: List<File>, oldPackage: String): DexRewriter.ClassIndex {
         val names = mutableSetOf<String>()

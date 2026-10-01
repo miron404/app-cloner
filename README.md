@@ -97,6 +97,29 @@ narrow as it can usefully be:
 
 It is still a modification of someone else's code, and it is marked experimental for that reason.
 
+### Why it refuses on large apps
+
+Changing one string means re-sorting the dex string pool, and ARSCLib re-sorts the type, proto,
+field, method and class sections with it, because items there reference strings by object rather
+than by index. So the whole dex has to exist as objects at once. Measured against this app's own
+debug build, whose largest dex is 42 MB, that costs **more than twelve times the size of the file**:
+rebuilding it does not fit in the 512 MB a JVM gets by default, which is why the unit test that does
+it asks for 2 GB.
+
+A phone gives one app 512 MB with `largeHeap` on, and no more. So deep rename is budgeted rather
+than attempted: the largest dex is measured against the heap actually free, with room kept back for
+everything that is not the rewrite, and an app that cannot fit is refused **before** the indexing
+pass with a message saying how big the dex is and how much it would have needed. Being refused in a
+second is the point — the alternative is finding out by exhausting the heap, and an
+`OutOfMemoryError` lands on whichever thread allocates next, which is often the one drawing the
+screen. That kills the process and loses the whole build, not just the rewrite.
+
+The reserve matters for the same reason. Leaving the app mid-build and coming back is the normal
+case, and a recreated activity rebuilds the entire Compose tree; on a heap with nothing spare, that
+is the allocation that throws.
+
+The manifest rename needs none of this and is never refused.
+
 ## What will not work
 
 Cloning changes the package name and the signing key. Anything keyed to either of those breaks, and
@@ -179,6 +202,7 @@ one that produced it:
 | `IconInjectionTest` | The hand-built `<adaptive-icon>` document round-trips through the parser, the manifest's icon id resolves to an entry carrying both configurations, and each layer references a drawable that was actually added. |
 | `ClonePipelineTest` | A whole build in the right order: renamed, re-iconed, signed, and accepted by `ApkVerifier` as the identity that signed it, with the badge in the corner the request asked for. |
 | `BadgeGeometryTest` | Every badge corner leaves the badge inside a circular mask, and a clone recorded before the corner was a setting still decodes — which matters because the registry treats a decoding failure as an empty file. |
+| `DexHeapBudgetTest` | The budget that decides whether a deep rename is attempted: this app's own 42 MB dex is refused against a phone's 512 MB heap and allowed against the 2 GB the tests get, the reserve is left free, and an undeclared entry size is not read as costing nothing. |
 
 What no test here covers is the last step: a clone actually installing and running on a device.
 `PackageInstaller` needs a real user confirming a real dialog, so that is the part to try by hand.
