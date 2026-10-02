@@ -23,7 +23,15 @@ import kotlin.coroutines.coroutineContext
  * read-only where they lie — and each stage writes a new file, so a failure part way through
  * leaves nothing but rubbish in the work directory.
  */
-class ClonePipeline(private val icons: IconRenderer) {
+class ClonePipeline(
+    private val icons: IconRenderer,
+    /**
+     * Where deep rename's dex files are rewritten: a process of its own on a device, so the largest
+     * allocation a clone makes cannot take the app down with it. Opened only when deep rename is
+     * on, and closed as soon as there are no dex files left to rewrite.
+     */
+    private val openDexWorker: suspend () -> DexWorker = { InProcessDexWorker() },
+) {
 
     suspend fun build(
         source: SourceApks,
@@ -54,35 +62,44 @@ class ClonePipeline(private val icons: IconRenderer) {
         val minSdk = runCatching { ApkSigningService.inspect(source.base).minSdkVersion }
             .getOrDefault(DEFAULT_MIN_SDK)
 
-        // Every dex in the app is indexed before any of them is edited: a string naming a class
-        // that lives in a different dex still has to be left alone.
-        val classIndex = if (request.deepRename) {
-            // Asked before the indexing pass, which reads every dex in the app: there is no point
-            // spending that on a rewrite the heap cannot hold. The same question is asked again at
-            // the moment of each rewrite, when the answer is exact.
-            requireRoomForDeepRename(source.all)
-            onProgress(CloneProgress("Indexing classes", "so reflection keeps working"))
-            buildClassIndex(source.all, oldPackage)
-        } else {
-            null
-        }
-
-        // Rendered from the source APKs before anything is rewritten, because that is where the
-        // icon's own resources still are.
-        val images = if (request.iconMode == IconMode.BADGE) {
-            onProgress(CloneProgress("Rendering icon"))
-            icons.render(source, request.badgeText, request.badgeCorner).also {
-                if (it == null) {
-                    warnings += "The source app's icon could not be rendered, so it was left " +
-                        "as it is."
-                }
-            }
+        // Started before anything else deep rename does, because the heap the size check has to be
+        // made against is that process's, not this one's.
+        val dexWorker = if (request.deepRename) {
+            onProgress(CloneProgress("Starting the dex worker", "a process with a heap to itself"))
+            openDexWorker()
         } else {
             null
         }
 
         val outputs = mutableListOf<File>()
         try {
+            // Every dex in the app is indexed before any of them is edited: a string naming a class
+            // that lives in a different dex still has to be left alone. The index goes to a file,
+            // which is how it reaches the worker, and is not kept here once written.
+            val classIndex = if (dexWorker != null) {
+                // Asked before the indexing pass, which reads every dex in the app: there is no
+                // point spending that on a rewrite the worker's heap could never hold.
+                requireRoomForDeepRename(source.all, dexWorker.heapLimit)
+                onProgress(CloneProgress("Indexing classes", "so reflection keeps working"))
+                File(dexScratch, CLASS_INDEX).also { buildClassIndex(source.all, oldPackage).write(it) }
+            } else {
+                null
+            }
+
+            // Rendered from the source APKs before anything is rewritten, because that is where
+            // the icon's own resources still are.
+            val images = if (request.iconMode == IconMode.BADGE) {
+                onProgress(CloneProgress("Rendering icon"))
+                icons.render(source, request.badgeText, request.badgeCorner).also {
+                    if (it == null) {
+                        warnings += "The source app's icon could not be rendered, so it was left " +
+                            "as it is."
+                    }
+                }
+            } else {
+                null
+            }
+
             source.all.forEachIndexed { index, apk ->
                 coroutineContext.ensureActive()
                 val isBase = index == 0
@@ -114,13 +131,14 @@ class ClonePipeline(private val icons: IconRenderer) {
                         renameIntentActions = request.renameIntentActions,
                     )
 
-                    if (classIndex != null) {
+                    if (dexWorker != null && classIndex != null) {
                         val result = rewriteDex(
                             module = module,
                             apk = apk,
                             oldPackage = oldPackage,
                             newPackage = newPackage,
-                            index = classIndex,
+                            worker = dexWorker,
+                            classIndex = classIndex,
                             scratch = dexScratch,
                             // The module name is the same for a base and its splits, so the
                             // position in the set is what keeps the scratch files apart.
@@ -163,6 +181,9 @@ class ClonePipeline(private val icons: IconRenderer) {
                     outputs += File(outDir, name)
                 }
             }
+            // Nothing is left for it to rewrite, and signing can take a while: there is no reason
+            // for a process holding the remains of the last dex model to wait through it.
+            dexWorker?.close()
 
             // One signer, one minSdk and one set of schemes across the base and every split: a
             // session install rejects a set whose members do not agree.
@@ -203,29 +224,31 @@ class ClonePipeline(private val icons: IconRenderer) {
                 outputs = signed,
                 clonePackage = newPackage,
                 manifest = manifestReport,
-                dex = classIndex?.let { DexRewriteReport(dexFiles, dexChanged, dexSkipped) },
+                dex = dexWorker?.let { DexRewriteReport(dexFiles, dexChanged, dexSkipped) },
                 icon = iconSummary,
                 signerFingerprint = identity.meta.fingerprintSha256,
                 warnings = warnings,
             )
         } finally {
+            dexWorker?.close()
             unsignedDir.deleteRecursively()
             dexScratch.deleteRecursively()
         }
     }
 
     /**
-     * Rewrites the string pools of every dex in one APK.
+     * Rewrites the string pools of every dex in one APK, by way of [worker].
      *
      * Returns how many dex files were seen, how many strings moved, and how many were left alone
      * because they name a class the app actually contains.
      */
-    private fun rewriteDex(
+    private suspend fun rewriteDex(
         module: ApkModule,
         apk: File,
         oldPackage: String,
         newPackage: String,
-        index: DexRewriter.ClassIndex,
+        worker: DexWorker,
+        classIndex: File,
         scratch: File,
         prefix: String,
     ): Triple<Int, Int, Int> {
@@ -238,25 +261,19 @@ class ClonePipeline(private val icons: IconRenderer) {
             files++
             val method = source.method
             val output = File(scratch, "$prefix-$name")
-            val size = sizes[name] ?: 0L
-            // The model for the dex before this one is unreachable but not necessarily collected,
-            // and a multidex app goes round this loop with hundreds of megabytes of it still
-            // counted as used. Asking first costs a pause; not asking spends the whole budget on
-            // rubbish and runs out on the second dex of nine.
-            if (files > 1) System.gc()
-            val result = try {
-                source.openStream().use { stream ->
-                    DexRewriter.rewrite(stream, oldPackage, newPackage, index, output)
-                }
-            } catch (error: OutOfMemoryError) {
-                // The estimate was optimistic. Say so and stop, rather than leaving the process to
-                // die on whichever thread allocates next — which may well be the one drawing the
-                // screen, and then the whole build is lost rather than just the rewrite.
-                throw IllegalStateException(
-                    DexRewriter.tooLargeMessage(name, apk.name, size, DexRewriter.heapLimit()),
-                    error,
-                )
-            }
+            // The worker reads the entry from the APK file itself rather than from this module:
+            // nothing has touched the dex entries yet, so the two are the same bytes, and a path
+            // is all that has to cross into the other process.
+            val job = DexJob(
+                apk = apk.absolutePath,
+                entry = name,
+                oldPackage = oldPackage,
+                newPackage = newPackage,
+                classIndex = classIndex.absolutePath,
+                output = output.absolutePath,
+            )
+            val result = worker.rewrite(job)
+                .requireRewritten(job, sizes[name] ?: 0L, worker.heapLimit)
             changed += result.changed
             skipped += result.skipped
             if (!result.written) continue
@@ -284,17 +301,15 @@ class ClonePipeline(private val icons: IconRenderer) {
         }
 
     /**
-     * Refuses a deep rename whose largest dex could not be rebuilt in this device's heap however
+     * Refuses a deep rename whose largest dex could not be rebuilt in the worker's heap however
      * empty it were.
      *
-     * The limit is real and not generous: a phone gives one app a few hundred megabytes even when
-     * it asks for a large heap, and the object model for a dex is many times the size of the file.
-     * Finding that out by running out of memory costs the user the whole build and, as often as
-     * not, the process; finding it out here costs a second, before the indexing pass has read a
-     * single dex.
+     * The limit is real and not generous: a phone gives a process a few hundred megabytes even
+     * when the app asks for a large heap, and the object model for a dex is many times the size of
+     * the file. Since the worker has a process of its own, running out no longer costs the app —
+     * but it still costs the user the minutes spent before it happened, where this costs a second.
      */
-    private fun requireRoomForDeepRename(apks: List<File>) {
-        val limit = DexRewriter.heapLimit()
+    private fun requireRoomForDeepRename(apks: List<File>, limit: Long) {
         for (apk in apks) {
             val largest = dexSizes(apk).maxByOrNull { it.value } ?: continue
             if (!DexRewriter.fitsInHeap(largest.value, limit)) {
@@ -365,6 +380,7 @@ class ClonePipeline(private val icons: IconRenderer) {
 
     private companion object {
         const val DEFAULT_MIN_SDK = 24
+        const val CLASS_INDEX = "class-index.txt"
     }
 }
 

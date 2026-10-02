@@ -27,7 +27,8 @@ import java.io.InputStream
  * Rebuilding a dex is the memory-hungry part of a clone, because re-sorting the string pool means
  * every offset in the file has to be laid out again. Only one dex is ever held as an object model,
  * it is read straight from the archive and written straight to a file, and the read-only indexing
- * pass avoids the model entirely.
+ * pass avoids the model entirely. On a device even that one model is built in a process of its own
+ * — see [DexWorker] — so it has the whole heap and running out of it cannot take the app down.
  */
 object DexRewriter {
 
@@ -35,6 +36,28 @@ object DexRewriter {
     class ClassIndex(private val names: Set<String>) {
         operator fun contains(dotted: String) = dotted in names
         val size: Int get() = names.size
+
+        /**
+         * Writes one name per line, for the worker process to read back.
+         *
+         * A file rather than the binder call itself, because a large app's index is far past the
+         * megabyte a binder transaction can carry. Lines are safe as a separator: the dex format's
+         * definition of a simple name has room for spaces since version 040, but not for a line
+         * feed or a carriage return, so nothing here is trimmed and nothing needs escaping.
+         */
+        fun write(file: File) {
+            file.bufferedWriter().use { out ->
+                for (name in names) {
+                    out.write(name)
+                    out.write("\n")
+                }
+            }
+        }
+
+        companion object {
+            fun read(file: File): ClassIndex =
+                ClassIndex(file.useLines { lines -> lines.filter { it.isNotEmpty() }.toHashSet() })
+        }
     }
 
     /** Collects the class names in one dex by walking its string pool directly. */
@@ -107,14 +130,14 @@ object DexRewriter {
     const val MODEL_HEAP_FACTOR = 20L
 
     /**
-     * Heap that has to stay free for everything which is not this rewrite.
+     * Heap the worker process needs for something other than the model: the runtime's own
+     * baseline, the class index, and the buffers the archive is read through.
      *
-     * Leaving the app mid-build and coming back is the normal case rather than the exception, and
-     * a recreated activity rebuilds the entire Compose tree. With nothing spare, that allocation
-     * is the one that throws — on the main thread, where it takes the process down instead of
-     * failing the build.
+     * It is small because that process does nothing else. Before it existed this had to cover the
+     * whole app — the resource table being rewritten, and the Compose tree a returning activity
+     * rebuilds — and that was the allocation which threw, on the main thread.
      */
-    const val HEAP_RESERVE = 96L * 1024 * 1024
+    const val HEAP_RESERVE = 32L * 1024 * 1024
 
     /** What building the object model for a dex of [dexBytes] is expected to cost. */
     fun estimateModelHeap(dexBytes: Long): Long = dexBytes * MODEL_HEAP_FACTOR
@@ -134,19 +157,44 @@ object DexRewriter {
     fun fitsInHeap(dexBytes: Long, heapLimit: Long): Boolean =
         dexBytes <= 0 || estimateModelHeap(dexBytes) + HEAP_RESERVE <= heapLimit
 
-    /** The most heap this process will ever be given. */
+    /** The most heap the calling process will ever be given. */
     fun heapLimit(): Long = Runtime.getRuntime().maxMemory()
 
     /**
-     * Why a dex cannot be rewritten here, phrased for someone who has to decide what to do about
-     * it. Deep rename is the only thing that needs this, and turning it off is always available.
+     * Why a dex is not even attempted, phrased for someone who has to decide what to do about it.
+     * Deep rename is the only thing that needs this, and turning it off is always available.
      */
     fun tooLargeMessage(dexName: String, apkName: String, dexBytes: Long, heapLimit: Long) =
         "$dexName in $apkName is ${megabytes(dexBytes)}, and rebuilding its string pool needs " +
-            "about ${megabytes(estimateModelHeap(dexBytes))} of heap. The most this device gives " +
-            "one app is ${megabytes(heapLimit)}, and some of that has to stay free for the screen. " +
-            "Turn deep rename off to clone this app: the package is still renamed everywhere the " +
-            "manifest declares it, which is all most apps need."
+            "about ${megabytes(estimateModelHeap(dexBytes))} of heap. The process that does it " +
+            "can have at most ${megabytes(heapLimit)} on this device. " + TURN_IT_OFF
+
+    /**
+     * Why a dex that was attempted did not come back: the estimate was optimistic, or the process
+     * doing the work was stopped. [died] tells the two apart, and [dexBytes] may be zero when the
+     * archive did not declare a size.
+     */
+    fun ranOutMessage(
+        dexName: String,
+        apkName: String,
+        dexBytes: Long,
+        heapLimit: Long,
+        died: Boolean,
+    ): String {
+        val what = if (dexBytes > 0) "$dexName in $apkName (${megabytes(dexBytes)})" else
+            "$dexName in $apkName"
+        val happened = if (died) {
+            "The process rebuilding $what stopped before it finished. With a dex to rebuild that " +
+                "is almost always its ${megabytes(heapLimit)} heap running out."
+        } else {
+            "Rebuilding $what ran out of the ${megabytes(heapLimit)} of heap the process doing " +
+                "it is allowed."
+        }
+        return "$happened $TURN_IT_OFF"
+    }
+
+    private const val TURN_IT_OFF = "Turn deep rename off to clone this app: the package is " +
+        "still renamed everywhere the manifest declares it, which is all most apps need."
 
     private fun megabytes(bytes: Long) = "%.0f MB".format(bytes / 1048576.0)
 }

@@ -4,9 +4,14 @@ import com.reandroid.apk.ApkModule
 import io.github.miron404.appcloner.clone.BadgeCorner
 import io.github.miron404.appcloner.clone.CloneRequest
 import io.github.miron404.appcloner.clone.ClonePipeline
+import io.github.miron404.appcloner.clone.DexJob
+import io.github.miron404.appcloner.clone.DexOutcome
+import io.github.miron404.appcloner.clone.DexWorker
 import io.github.miron404.appcloner.clone.IconImages
 import io.github.miron404.appcloner.clone.IconInjector
 import io.github.miron404.appcloner.clone.IconMode
+import io.github.miron404.appcloner.clone.IconRenderer
+import io.github.miron404.appcloner.clone.InProcessDexWorker
 import io.github.miron404.appcloner.clone.SourceApks
 import io.github.miron404.appcloner.clone.SourceInfo
 import io.github.miron404.appcloner.clone.SourceKind
@@ -15,7 +20,9 @@ import io.github.miron404.appcloner.core.Bc
 import io.github.miron404.appcloner.core.SignatureSchemes
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.BeforeClass
@@ -91,7 +98,81 @@ class ClonePipelineTest {
         assertTrue(verification.errors.joinToString(" | "), verification.verified)
     }
 
-    private fun build(source: SourceApks, deepRename: Boolean) = runBlocking {
+    /**
+     * A deep rename the worker's heap could never hold is refused before the indexing pass, and
+     * the worker — on a device, a process of its own — is shut down rather than left running.
+     */
+    @Test
+    fun `deep rename is refused up front when the worker's heap is too small`() {
+        val source = fixture() ?: return
+        val worker = FakeDexWorker(heapLimit = 64L * 1024 * 1024, outcome = DexOutcome())
+
+        val refusal = assertThrows(IllegalStateException::class.java) {
+            build(source, deepRename = true, worker = worker)
+        }
+
+        assertTrue(refusal.message, refusal.message.orEmpty().contains("deep rename"))
+        assertEquals("nothing should have been sent to the worker", 0, worker.jobs)
+        assertTrue("the worker was left running", worker.closed)
+    }
+
+    /**
+     * The case reported from the phone, now that it happens somewhere it can be survived: the
+     * worker runs out, the build fails with a message, and the worker is shut down with it.
+     */
+    @Test
+    fun `a worker that runs out of memory fails the build and is shut down`() {
+        val source = fixture() ?: return
+        val worker = FakeDexWorker(heapLimit = Long.MAX_VALUE, outcome = DexOutcome(outOfMemory = true))
+
+        val failure = assertThrows(IllegalStateException::class.java) {
+            build(source, deepRename = true, worker = worker)
+        }
+
+        assertTrue(failure.message, failure.message.orEmpty().contains("ran out"))
+        assertTrue(failure.message, failure.message.orEmpty().contains("classes.dex"))
+        assertEquals("the build should stop at the first dex that fails", 1, worker.jobs)
+        assertTrue("the worker was left running", worker.closed)
+    }
+
+    @Test
+    fun `no worker is started when deep rename is off`() {
+        val source = fixture() ?: return
+        val worker = FakeDexWorker(heapLimit = Long.MAX_VALUE, outcome = DexOutcome())
+
+        build(source, deepRename = false, worker = worker)
+
+        assertEquals(0, worker.jobs)
+        assertFalse("a worker was opened for a build that had no use for it", worker.opened)
+    }
+
+    /** Answers every job with [outcome], and remembers what was asked of it. */
+    private class FakeDexWorker(override val heapLimit: Long, private val outcome: DexOutcome) :
+        DexWorker {
+        var opened = false
+        var jobs = 0
+        var closed = false
+
+        override suspend fun rewrite(job: DexJob): DexOutcome {
+            jobs++
+            return outcome
+        }
+
+        override fun close() {
+            closed = true
+        }
+    }
+
+    private val icons = IconRenderer { _, _, _ ->
+        IconImages(
+            foreground = "fg".toByteArray(),
+            background = "bg".toByteArray(),
+            monochrome = "mono".toByteArray(),
+            flattened = "flat".toByteArray(),
+        )
+    }
+
+    private fun build(source: SourceApks, deepRename: Boolean, worker: FakeDexWorker? = null) = runBlocking {
         val request = CloneRequest(
             label = "Cloned",
             packageName = clonePackage,
@@ -103,14 +184,14 @@ class ClonePipelineTest {
             renameIntentActions = false,
             cloneIndex = 2,
         )
-        val pipeline = ClonePipeline { _, _, _ ->
-            IconImages(
-                foreground = "fg".toByteArray(),
-                background = "bg".toByteArray(),
-                monochrome = "mono".toByteArray(),
-                flattened = "flat".toByteArray(),
-            )
-        }
+        // Without a fake, the real work is done in this JVM through the same runner the worker
+        // process uses, index file and all.
+        val pipeline = ClonePipeline(
+            icons = icons,
+            openDexWorker = {
+                worker?.also { it.opened = true } ?: InProcessDexWorker()
+            },
+        )
         testIdentity("pipeline").use { identity ->
             pipeline.build(
                 source = source,

@@ -7,6 +7,7 @@ import io.github.miron404.appcloner.clone.BuildController
 import io.github.miron404.appcloner.clone.CloneRegistry
 import io.github.miron404.appcloner.clone.ClonePipeline
 import io.github.miron404.appcloner.clone.Installer
+import io.github.miron404.appcloner.clone.RemoteDexWorker
 import io.github.miron404.appcloner.core.AppSettings
 import io.github.miron404.appcloner.core.Bc
 import io.github.miron404.appcloner.core.MasterKey
@@ -24,7 +25,10 @@ class AppContainer(context: Context) {
     val masterKey = MasterKey(authenticator)
     val vault = Vault(File(context.filesDir, "vault"), masterKey, settings)
     val registry = CloneRegistry(File(context.filesDir, "clones.json"))
-    val pipeline = ClonePipeline(AndroidIconRenderer(context))
+    val pipeline = ClonePipeline(
+        icons = AndroidIconRenderer(context),
+        openDexWorker = { RemoteDexWorker.open(context) },
+    )
     val installer = Installer(context)
 
     /** Where finished clones are kept so they can still be installed or exported later. */
@@ -62,6 +66,12 @@ class AppClonerApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        // Android creates this class in every process the app has, and the dex worker runs in one
+        // of its own. Nothing below belongs there, and two of the steps would do real damage: the
+        // work directory holds the staged APKs that process is about to read, and a vault repair
+        // racing the main process's could finish a rekey twice. The container is never created
+        // there, and nothing in that process asks for it.
+        if (Application.getProcessName() != packageName) return
         // Android's built-in "BC" provider is a stripped subset; swap in the full build before any
         // crypto runs so PKCS#12 writing and certificate building resolve to it.
         Bc.install()

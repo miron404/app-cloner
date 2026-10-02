@@ -78,6 +78,17 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <!--
+            Rewrites dex files for deep rename in a process of its own. The object model of one
+            large dex can take most of the heap a phone allows an app; here it gets all of that,
+            and running out of it ends this process instead of the one drawing the screen. Not
+            isolatedProcess: it reads the source APKs and writes into the app's own files.
+        -->
+        <service
+            android:name=".clone.DexWorkerService"
+            android:exported="false"
+            android:process=":dex" />
+
         <receiver
             android:name=".clone.InstallResultReceiver"
             android:exported="false" />

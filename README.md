@@ -97,7 +97,7 @@ narrow as it can usefully be:
 
 It is still a modification of someone else's code, and it is marked experimental for that reason.
 
-### Why it refuses on large apps
+### Where it runs, and why
 
 Changing one string means re-sorting the dex string pool, and ARSCLib re-sorts the type, proto,
 field, method and class sections with it, because items there reference strings by object rather
@@ -106,25 +106,31 @@ debug build, whose largest dex is 42 MB, that costs **more than twelve times the
 rebuilding it does not fit in the 512 MB a JVM gets by default, which is why the unit test that does
 it asks for 2 GB.
 
-A phone gives one app 512 MB with `largeHeap` on, and no more. So deep rename is budgeted rather
-than attempted: the largest dex is weighed against that ceiling, with room kept back for everything
-which is not the rewrite, and an app that cannot fit is refused **before** the indexing pass — which
-is itself a read of every dex in the app — with a message saying how big the dex is and how much it
-would have needed. Being refused in a second is the point. The alternative is finding out by
-exhausting the heap, and an `OutOfMemoryError` is thrown on whichever thread happens to allocate
-next, which is often the one drawing the screen: that kills the process and loses the whole build,
-not just the rewrite.
+That model used to be built in the same process as everything else, and it had to share the heap
+with the resource table being rewritten and with whatever the screen was holding. Leaving the app
+mid-build and coming back was enough to run it dry — and an `OutOfMemoryError` is thrown on
+whichever thread allocates next, which was the one rebuilding the Compose tree. The app died, and
+the build with it.
 
-The test is against the ceiling and not against free space on purpose. A model that has just been
-released is garbage that still counts as used until something collects it, so "free right now" reads
-far lower than what the next allocation can really have — measured that way, the ninth dex of this
-app's own debug build is refused on memory the first dex had just finished proving was there. What
-the loop does instead is ask for a collection between dexes, so the previous model is actually gone
-before the next one is built.
+So dex files are now rewritten in **a process of their own**, `:dex`, by `DexWorkerService`. It
+gets the whole of a phone's 512 MB `largeHeap` to itself, and if it runs out anyway, that process
+ends and this one reports a failed build. What crosses between them is a description of the job —
+paths, package names, and a class index written to a file — never a dex itself, which would be far
+past the megabyte a binder call can carry. The worker holds no key material and never creates the
+app's container; `AppClonerApplication` steps aside in any process but the main one, because
+clearing the work directory there would delete the staged APKs that worker is about to read.
 
-The reserve exists for the case that was reported: leaving the app mid-build and coming back is
-normal, and a recreated activity rebuilds the entire Compose tree. On a heap with nothing spare,
-that is the allocation that throws.
+One worker is started per build and ended as soon as there are no dex files left, before signing,
+so its heap goes back to the phone instead of lingering in a cached process. Ending it is also what
+makes **Cancel** work in the middle of a dex: a binder call cannot be interrupted, so cancelling
+stops the process, and the call returns at once.
+
+Separately, the size is checked before any of this starts. The largest dex is weighed against the
+worker's heap limit — the ceiling, not what happens to be free, because a model that has just been
+released still counts as used until something collects it — and an app that cannot fit is refused
+**before** the indexing pass with a message saying how big the dex is and how much it would have
+needed. Running out no longer costs the app, but it would still cost the minutes spent before it
+happened.
 
 The manifest rename needs none of this and is never refused.
 
@@ -211,11 +217,15 @@ one that produced it:
 | `ClonePipelineTest` | A whole build in the right order: renamed, re-iconed, signed, and accepted by `ApkVerifier` as the identity that signed it, with the badge in the corner the request asked for. |
 | `BadgeGeometryTest` | Every badge corner leaves the badge inside a circular mask, and a clone recorded before the corner was a setting still decodes — which matters because the registry treats a decoding failure as an empty file. |
 | `DexHeapBudgetTest` | The budget that decides whether a deep rename is attempted: this app's own 42 MB dex is refused against a phone's 512 MB heap and allowed against the 2 GB the tests get, the reserve is left free, and an undeclared entry size is not read as costing nothing. |
+| `DexWorkerTest` | Everything that crosses into the `:dex` process, without the process: the class index survives a file — spaces and characters outside the BMP included — jobs and outcomes survive the protocol, an impossible job comes back as an answer rather than an exception, and each way of failing becomes a message that names the dex. |
+| `ClonePipelineTest` (worker) | A build hands its dex files to the worker, refuses up front when the worker's heap is too small, fails cleanly when the worker runs out, starts no worker when deep rename is off — and shuts the worker down every time, because on a phone a forgotten one is a process holding half a gigabyte. |
 
 What no test here covers is the last step: a clone actually installing and running on a device.
 `PackageInstaller` needs a real user confirming a real dialog, so that is the part to try by hand.
 The same goes for leaving the app mid-build and finding the way back to it — that is Android
-lifecycle behaviour, not something a JVM test can stand in for.
+lifecycle behaviour, not something a JVM test can stand in for — and for the binder transport to the
+`:dex` process: the tests drive the same runner in-process, but starting the process, cancelling a
+build mid-dex, and the worker dying under it are things to try on a phone.
 
 ### Release signing
 

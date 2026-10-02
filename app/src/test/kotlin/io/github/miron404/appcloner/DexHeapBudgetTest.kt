@@ -8,16 +8,15 @@ import org.junit.Test
 /**
  * The arithmetic that decides whether a deep rename is attempted at all.
  *
- * It exists because the alternative way of finding out is an `OutOfMemoryError`, and that does not
- * land politely inside the build: on a heap with nothing left, the thread that throws is whichever
- * one allocates next, which is often the one drawing the screen. The user then loses the process
- * and the whole build rather than being told no.
+ * The rewrite happens in a worker process of its own, so getting this wrong no longer costs the
+ * app. It still costs the user the minutes spent indexing and rewriting before the worker ran out,
+ * where asking first costs a second.
  */
 class DexHeapBudgetTest {
 
     private val megabyte = 1024L * 1024
 
-    /** The real case from the device: a dex this size against the heap a phone actually allows. */
+    /** The real case from the device: a dex this size against the heap a phone gives a process. */
     @Test
     fun `this app's own largest dex does not fit in a phone's heap`() {
         val dex = 42 * megabyte
@@ -49,7 +48,7 @@ class DexHeapBudgetTest {
         val model = DexRewriter.estimateModelHeap(dex)
 
         assertFalse(
-            "a heap that only just holds the model leaves nothing for the screen",
+            "a heap that only just holds the model leaves nothing for the worker itself",
             DexRewriter.fitsInHeap(dex, model),
         )
         assertTrue(DexRewriter.fitsInHeap(dex, model + DexRewriter.HEAP_RESERVE))
