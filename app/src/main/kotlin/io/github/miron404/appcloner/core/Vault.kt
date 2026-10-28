@@ -9,6 +9,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.File
+import java.io.IOException
 import java.util.Base64
 import java.util.UUID
 
@@ -90,11 +91,14 @@ class Vault(
         if (pending != null) {
             root.listFiles { file -> file.name.endsWith(STAGED_SUFFIX) }?.forEach { staged ->
                 val target = File(root, staged.name.removeSuffix(STAGED_SUFFIX))
-                if (!staged.renameTo(target)) {
-                    staged.copyTo(target, overwrite = true)
-                    staged.delete()
-                }
+                // No copying fallback: a half-copied blob is unreadable under either key. Left
+                // staged, the swap is simply tried again on the next start.
+                if (!staged.renameTo(target)) throw IOException("Could not swap in ${staged.name}")
             }
+            // Each step has to be on disk before the next one depends on it: the swapped blobs
+            // before the settings stop naming the old key, and the settings before that key is
+            // deleted. Out of order, a power cut leaves blobs no remaining key can open.
+            root.syncDirectory()
             val previous = settings.masterKeyAlias
             settings.masterKeyAlias = pending
             settings.pendingMasterKeyAlias = null
@@ -103,7 +107,9 @@ class Vault(
             // A rekey that never reached its commit point: discard the half-written copies.
             root.listFiles { file -> file.name.endsWith(STAGED_SUFFIX) }?.forEach { it.delete() }
         }
-        masterKey.deleteOrphans(setOfNotNull(settings.masterKeyAlias))
+        // With no alias recorded there is nothing to tell an orphan from the key the vault is
+        // sealed with, and deleting cannot be undone, so every key is kept.
+        settings.masterKeyAlias?.let { alias -> masterKey.deleteOrphans(setOf(alias)) }
     }
 
     fun state(): MasterKeyState {
@@ -218,7 +224,10 @@ class Vault(
      * has to be republished from: create, restore and both halves of rename all land here.
      */
     private fun writeMeta(meta: IdentityMeta) {
-        File(root, meta.id + META_SUFFIX).writeText(json.encodeToString(meta))
+        // Atomic like the key itself: a sealed key whose metadata is lost no longer appears in
+        // the list, and so cannot be used, exported or backed up.
+        File(root, meta.id + META_SUFFIX)
+            .writeBytesAtomically(json.encodeToString(meta).toByteArray(Charsets.UTF_8))
         _identities.value = list()
     }
 
@@ -307,10 +316,13 @@ class Vault(
             throw error
         }
 
-        // Commit point: from here on, repair() can always finish the swap.
-        settings.pendingMasterKeyAlias = newAlias
-        settings.desiredPolicy = policy
-        repair()
+        // Commit point: from here on, repair() can always finish the swap. Both write to disk
+        // synchronously, which is why they are kept off the main thread.
+        withContext(Dispatchers.IO) {
+            settings.pendingMasterKeyAlias = newAlias
+            settings.desiredPolicy = policy
+            repair()
+        }
     }
 
     private fun requireWrapper(): KeyWrapper {
@@ -323,14 +335,5 @@ class Vault(
         const val META_SUFFIX = ".meta.json"
         const val KEY_SUFFIX = ".key"
         const val STAGED_SUFFIX = ".staged"
-
-        fun File.writeBytesAtomically(bytes: ByteArray) {
-            val temporary = File(parentFile, "$name.tmp")
-            temporary.writeBytes(bytes)
-            if (!temporary.renameTo(this)) {
-                temporary.copyTo(this, overwrite = true)
-                temporary.delete()
-            }
-        }
     }
 }

@@ -292,6 +292,30 @@ class VaultTest {
     }
 
     @Test
+    fun `settings that name no master key never cost the keys that exist`() = runTest {
+        vault.ensureMasterKey()
+        vault.create(request("one"))
+        val alias = settings.masterKeyAlias!!
+
+        // Settings lost while the keystore and the sealed blobs were not: every key is now an
+        // "orphan", and one of them is the only thing that opens the vault.
+        settings.masterKeyAlias = null
+        Vault(root, keyStore, settings).repair()
+
+        assertTrue(keyStore.exists(alias))
+    }
+
+    @Test
+    fun `writes leave no temporary files behind`() = runTest {
+        vault.ensureMasterKey()
+        val meta = vault.create(request("one"))
+        vault.rename(meta, "renamed", "")
+        vault.rekey(AuthPolicy(timeoutSeconds = 60, allowDeviceCredential = true))
+
+        assertTrue(root.listFiles()!!.none { it.name.endsWith(".tmp") })
+    }
+
+    @Test
     fun `renaming the label leaves the sealed keystore untouched`() = runTest {
         vault.ensureMasterKey()
         val meta = vault.create(request("before"))
