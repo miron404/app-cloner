@@ -5,10 +5,11 @@ import java.io.EOFException
 /**
  * Reads the string pool out of a dex without building a model of the rest of it.
  *
- * The indexing pass only has to answer one question — which classes does this app define — and
- * every type descriptor is a string in the pool. Parsing a whole dex into objects to find that out
- * costs hundreds of megabytes on a large app and is what made the first version run out of heap.
- * Walking `string_ids` by hand costs the size of the file and nothing else.
+ * The indexing pass has two questions to answer — which classes does this app define, and which
+ * dex files have a string a deep rename would move — and both are about strings in the pool.
+ * Parsing a whole dex into objects to find that out costs hundreds of megabytes on a large app and
+ * is what made the first version run out of heap. Walking `string_ids` by hand costs the size of
+ * the file and nothing else.
  *
  * The layout being read is fixed by the dex format:
  *
@@ -46,29 +47,61 @@ object DexStringTable {
         }
     }
 
-    /**
-     * Dotted names of every class in [dex] that lives under [packageName].
-     *
-     * These are the names that must not be rewritten as strings: they are what `Class.forName` is
-     * given, and the classes keep their original descriptors.
-     */
-    fun classNamesUnder(dex: ByteArray, packageName: String): Set<String> {
-        val prefix = ("L" + packageName.replace('.', '/')).toByteArray(Charsets.US_ASCII)
-        val names = mutableSetOf<String>()
+    /** What one dex holds under a package, as far as a deep rename is concerned. */
+    class Scan(
+        /**
+         * Dotted names of every class the dex defines under the package. These are the names that
+         * must not be rewritten as strings: they are what `Class.forName` is given, and the classes
+         * keep their original descriptors.
+         */
+        val classNames: Set<String>,
+        /**
+         * Every string that is the package itself or a dotted name under it — exactly the strings
+         * [DexRewriter.rewrite] would consider moving, before class names are taken out.
+         */
+        val packageStrings: Set<String>,
+    )
+
+    /** Reads both halves of a [Scan] for [packageName] out of [dex] in one walk of its pool. */
+    fun scan(dex: ByteArray, packageName: String): Scan {
+        val descriptor = ("L" + packageName.replace('.', '/')).toByteArray(Charsets.US_ASCII)
+        val dotted = packageName.toByteArray(Charsets.US_ASCII)
+        val classNames = mutableSetOf<String>()
+        val packageStrings = mutableSetOf<String>()
         forEachString(dex) { start, end ->
             val length = end - start
-            // 'Lcom/foo' plus at least a separator and the closing semicolon.
-            if (length <= prefix.size) return@forEachString
-            if (dex[end - 1] != ';'.code.toByte()) return@forEachString
-            for (i in prefix.indices) {
-                if (dex[start + i] != prefix[i]) return@forEachString
+            if (isClassUnder(dex, start, end, descriptor)) {
+                classNames += String(dex, start + 1, length - 2, Charsets.UTF_8).replace('/', '.')
+            } else if (startsWith(dex, start, end, dotted) &&
+                (length == dotted.size || dex[start + dotted.size] == '.'.code.toByte())
+            ) {
+                packageStrings += String(dex, start, length, Charsets.UTF_8)
             }
-            // Guard against 'Lcom/foobar;' matching the prefix of package 'com.foo'.
-            val next = dex[start + prefix.size]
-            if (next != '/'.code.toByte() && next != ';'.code.toByte()) return@forEachString
-            names += String(dex, start + 1, length - 2, Charsets.UTF_8).replace('/', '.')
         }
-        return names
+        return Scan(classNames, packageStrings)
+    }
+
+    /** Dotted names of every class in [dex] that lives under [packageName]. */
+    fun classNamesUnder(dex: ByteArray, packageName: String): Set<String> =
+        scan(dex, packageName).classNames
+
+    /** Whether the string at [start] is a descriptor `Lcom/foo/…;` for the package [prefix] names. */
+    private fun isClassUnder(dex: ByteArray, start: Int, end: Int, prefix: ByteArray): Boolean {
+        // 'Lcom/foo' plus at least a separator and the closing semicolon.
+        if (end - start <= prefix.size) return false
+        if (dex[end - 1] != ';'.code.toByte()) return false
+        if (!startsWith(dex, start, end, prefix)) return false
+        // Guard against 'Lcom/foobar;' matching the prefix of package 'com.foo'.
+        val next = dex[start + prefix.size]
+        return next == '/'.code.toByte() || next == ';'.code.toByte()
+    }
+
+    private fun startsWith(dex: ByteArray, start: Int, end: Int, prefix: ByteArray): Boolean {
+        if (end - start < prefix.size) return false
+        for (i in prefix.indices) {
+            if (dex[start + i] != prefix[i]) return false
+        }
+        return true
     }
 
     private fun ByteArray.readInt(at: Int): Int {

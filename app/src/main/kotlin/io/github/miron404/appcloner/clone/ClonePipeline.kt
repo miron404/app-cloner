@@ -27,8 +27,8 @@ class ClonePipeline(
     private val icons: IconRenderer,
     /**
      * Where deep rename's dex files are rewritten: a process of its own on a device, so the largest
-     * allocation a clone makes cannot take the app down with it. Opened only when deep rename is
-     * on, and closed as soon as there are no dex files left to rewrite.
+     * allocation a clone makes cannot take the app down with it. Opened only when deep rename has
+     * a dex with something in it to move, and closed as soon as there are none left.
      */
     private val openDexWorker: suspend () -> DexWorker = { InProcessDexWorker() },
 ) {
@@ -57,33 +57,35 @@ class ClonePipeline(
         var iconSummary = IconMode.KEEP.label
         var dexChanged = 0
         var dexSkipped = 0
-        var dexFiles = 0
 
         val minSdk = runCatching { ApkSigningService.inspect(source.base).minSdkVersion }
             .getOrDefault(DEFAULT_MIN_SDK)
 
-        // Started before anything else deep rename does, because the heap the size check has to be
-        // made against is that process's, not this one's.
-        val dexWorker = if (request.deepRename) {
-            onProgress(CloneProgress("Starting the dex worker", "a process with a heap to itself"))
-            openDexWorker()
-        } else {
-            null
-        }
-
+        var dexWorker: DexWorker? = null
         val outputs = mutableListOf<File>()
         try {
             // Every dex in the app is indexed before any of them is edited: a string naming a class
-            // that lives in a different dex still has to be left alone. The index goes to a file,
-            // which is how it reaches the worker, and is not kept here once written.
-            val classIndex = if (dexWorker != null) {
-                // Asked before the indexing pass, which reads every dex in the app: there is no
-                // point spending that on a rewrite the worker's heap could never hold.
-                requireRoomForDeepRename(source.all, dexWorker.heapLimit)
+            // that lives in a different dex still has to be left alone. The same pass says which
+            // dex files have anything to move, and only those are ever sent to the worker.
+            val dexPlan = if (request.deepRename) {
                 onProgress(CloneProgress("Indexing classes", "so reflection keeps working"))
-                File(dexScratch, CLASS_INDEX).also { buildClassIndex(source.all, oldPackage).write(it) }
+                planDexRewrite(source.all, oldPackage)
             } else {
                 null
+            }
+
+            // The index goes to a file, which is how it reaches the worker, and is not kept here
+            // once written.
+            var classIndex: File? = null
+            if (dexPlan != null && dexPlan.pending.isNotEmpty()) {
+                onProgress(
+                    CloneProgress("Starting the dex worker", "a process with a heap to itself")
+                )
+                val worker = openDexWorker().also { dexWorker = it }
+                // The heap that matters is that process's, not this one's, and only the dex files
+                // that are going to be rebuilt are held against it.
+                requireRoomForDeepRename(dexPlan.pending, worker.heapLimit)
+                classIndex = File(dexScratch, CLASS_INDEX).also { dexPlan.classIndex.write(it) }
             }
 
             // Rendered from the source APKs before anything is rewritten, because that is where
@@ -131,22 +133,24 @@ class ClonePipeline(
                         renameIntentActions = request.renameIntentActions,
                     )
 
-                    if (dexWorker != null && classIndex != null) {
+                    val worker = dexWorker
+                    val pending = dexPlan?.pending?.get(apk)
+                    if (worker != null && classIndex != null && pending != null) {
                         val result = rewriteDex(
                             module = module,
                             apk = apk,
+                            pending = pending,
                             oldPackage = oldPackage,
                             newPackage = newPackage,
-                            worker = dexWorker,
+                            worker = worker,
                             classIndex = classIndex,
                             scratch = dexScratch,
                             // The module name is the same for a base and its splits, so the
                             // position in the set is what keeps the scratch files apart.
                             prefix = index.toString(),
                         )
-                        dexFiles += result.first
-                        dexChanged += result.second
-                        dexSkipped += result.third
+                        dexChanged += result.first
+                        dexSkipped += result.second
                     }
 
                     if (isBase && images != null) {
@@ -224,7 +228,9 @@ class ClonePipeline(
                 outputs = signed,
                 clonePackage = newPackage,
                 manifest = manifestReport,
-                dex = dexWorker?.let { DexRewriteReport(dexFiles, dexChanged, dexSkipped) },
+                dex = dexPlan?.let {
+                    DexRewriteReport(it.dexFiles, dexChanged, dexSkipped + it.sparedUnsent)
+                },
                 icon = iconSummary,
                 signerFingerprint = identity.meta.fingerprintSha256,
                 warnings = warnings,
@@ -237,28 +243,27 @@ class ClonePipeline(
     }
 
     /**
-     * Rewrites the string pools of every dex in one APK, by way of [worker].
+     * Rewrites the string pools of the [pending] dex files in one APK, by way of [worker].
      *
-     * Returns how many dex files were seen, how many strings moved, and how many were left alone
-     * because they name a class the app actually contains.
+     * Returns how many strings moved, and how many were left alone because they name a class the
+     * app actually contains. Every other dex keeps its original entry, byte for byte.
      */
     private suspend fun rewriteDex(
         module: ApkModule,
         apk: File,
+        pending: Map<String, Long>,
         oldPackage: String,
         newPackage: String,
         worker: DexWorker,
         classIndex: File,
         scratch: File,
         prefix: String,
-    ): Triple<Int, Int, Int> {
-        var files = 0
+    ): Pair<Int, Int> {
         var changed = 0
         var skipped = 0
-        val sizes = dexSizes(apk)
         for (name in dexEntryNames(module)) {
+            val size = pending[name] ?: continue
             val source = module.zipEntryMap.getInputSource(name) ?: continue
-            files++
             val method = source.method
             val output = File(scratch, "$prefix-$name")
             // The worker reads the entry from the APK file itself rather than from this module:
@@ -272,8 +277,7 @@ class ClonePipeline(
                 classIndex = classIndex.absolutePath,
                 output = output.absolutePath,
             )
-            val result = worker.rewrite(job)
-                .requireRewritten(job, sizes[name] ?: 0L, worker.heapLimit)
+            val result = worker.rewrite(job).requireRewritten(job, size, worker.heapLimit)
             changed += result.changed
             skipped += result.skipped
             if (!result.written) continue
@@ -282,7 +286,7 @@ class ClonePipeline(
                 FileInputSource(output, name).apply { this.method = method }
             )
         }
-        return Triple(files, changed, skipped)
+        return changed to skipped
     }
 
     /** Multidex names its files `classes.dex`, `classes2.dex`, … with no gaps. */
@@ -292,26 +296,18 @@ class ClonePipeline(
             .takeWhile { module.zipEntryMap.contains(it) }
             .toList()
 
-    /** Uncompressed sizes of the dex entries in [apk], read from the archive's central directory. */
-    private fun dexSizes(apk: File): Map<String, Long> =
-        ZipFile(apk).use { zip ->
-            zip.entries().asSequence()
-                .filter { !it.isDirectory && DexRewriter.isDexEntry(it.name) }
-                .associate { it.name to it.size.coerceAtLeast(0L) }
-        }
-
     /**
-     * Refuses a deep rename whose largest dex could not be rebuilt in the worker's heap however
-     * empty it were.
+     * Refuses a deep rename whose largest dex to rebuild could not be rebuilt in the worker's heap
+     * however empty it were. A dex with nothing to move does not count, however large.
      *
      * The limit is real and not generous: a phone gives a process a few hundred megabytes even
      * when the app asks for a large heap, and the object model for a dex is many times the size of
      * the file. Since the worker has a process of its own, running out no longer costs the app —
      * but it still costs the user the minutes spent before it happened, where this costs a second.
      */
-    private fun requireRoomForDeepRename(apks: List<File>, limit: Long) {
-        for (apk in apks) {
-            val largest = dexSizes(apk).maxByOrNull { it.value } ?: continue
+    private fun requireRoomForDeepRename(pending: Map<File, Map<String, Long>>, limit: Long) {
+        for ((apk, dexes) in pending) {
+            val largest = dexes.maxByOrNull { it.value } ?: continue
             if (!DexRewriter.fitsInHeap(largest.value, limit)) {
                 throw IllegalStateException(
                     DexRewriter.tooLargeMessage(largest.key, apk.name, largest.value, limit)
@@ -320,21 +316,55 @@ class ClonePipeline(
         }
     }
 
-    private fun buildClassIndex(apks: List<File>, oldPackage: String): DexRewriter.ClassIndex {
-        val names = mutableSetOf<String>()
-        for (apk in apks) {
+    /**
+     * What the indexing pass learned about the dex files of a build.
+     *
+     * A dex that is not in [pending] holds nothing a deep rename would change, and keeps its entry
+     * without ever reaching the worker. Building its model would cost as much as building one that
+     * does change — for a large library dex, most of what a phone gives a process — and come to
+     * nothing; worse, the size check would refuse the whole rename on its account.
+     */
+    private class DexPlan(
+        val classIndex: DexRewriter.ClassIndex,
+        /** Every dex in the app, sent or not. */
+        val dexFiles: Int,
+        /** Per APK, the dex entries with a string to move, and the uncompressed size of each. */
+        val pending: Map<File, Map<String, Long>>,
+        /** Class names among the strings of dex files that were not sent, spared all the same. */
+        val sparedUnsent: Int,
+    )
+
+    private class ScannedDex(val size: Long, val packageStrings: Set<String>)
+
+    private fun planDexRewrite(apks: List<File>, oldPackage: String): DexPlan {
+        val classNames = mutableSetOf<String>()
+        // Only the strings under the old package are kept, never a dex itself: they come to a few
+        // hundred at most, where the dex is megabytes. Whether one moves cannot be told until
+        // every dex is indexed, since the class it names may be defined in any of them.
+        val scanned = apks.associateWith { apk ->
             ZipFile(apk).use { zip ->
                 zip.entries().asSequence()
                     .filter { !it.isDirectory && DexRewriter.isDexEntry(it.name) }
-                    .forEach { entry ->
-                        // One dex at a time, and only its bytes: indexing reads the string pool
-                        // directly rather than parsing the file into objects.
+                    .associate { entry ->
+                        // One dex at a time, and only its bytes: the string pool is read directly
+                        // rather than parsing the file into objects.
                         val bytes = zip.getInputStream(entry).use { it.readBytes() }
-                        names += DexRewriter.indexClasses(bytes, oldPackage)
+                        val scan = DexRewriter.scan(bytes, oldPackage)
+                        classNames += scan.classNames
+                        entry.name to ScannedDex(entry.size.coerceAtLeast(0L), scan.packageStrings)
                     }
             }
         }
-        return DexRewriter.ClassIndex(names)
+        val index = DexRewriter.ClassIndex(classNames)
+        var spared = 0
+        val pending = scanned.mapValues { (_, dexes) ->
+            dexes.filter { (_, dex) ->
+                val moves = DexRewriter.willMove(dex.packageStrings, index) > 0
+                if (!moves) spared += dex.packageStrings.size
+                moves
+            }.mapValues { (_, dex) -> dex.size }
+        }.filterValues { it.isNotEmpty() }
+        return DexPlan(index, scanned.values.sumOf { it.size }, pending, spared)
     }
 
     /**

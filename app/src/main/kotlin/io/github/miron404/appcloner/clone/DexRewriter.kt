@@ -27,7 +27,8 @@ import java.io.InputStream
  * Rebuilding a dex is the memory-hungry part of a clone, because re-sorting the string pool means
  * every offset in the file has to be laid out again. Only one dex is ever held as an object model,
  * it is read straight from the archive and written straight to a file, and the read-only indexing
- * pass avoids the model entirely. On a device even that one model is built in a process of its own
+ * pass avoids the model entirely. That pass also tells which dex files have anything to move, and
+ * only those are rebuilt at all. On a device even that one model is built in a process of its own
  * — see [DexWorker] — so it has the whole heap and running out of it cannot take the app down.
  */
 object DexRewriter {
@@ -63,6 +64,20 @@ object DexRewriter {
     /** Collects the class names in one dex by walking its string pool directly. */
     fun indexClasses(dexBytes: ByteArray, oldPackage: String): Set<String> =
         DexStringTable.classNamesUnder(dexBytes, oldPackage)
+
+    /**
+     * The class names in one dex, and the strings [rewrite] would look at, from its string pool.
+     *
+     * A dex whose package strings [willMove] counts as zero is one [rewrite] would read, model and
+     * then leave as it was. In a typical app that is every library dex, and
+     * the largest of them is usually the largest dex there is — so it is worth knowing in advance.
+     */
+    fun scan(dexBytes: ByteArray, oldPackage: String): DexStringTable.Scan =
+        DexStringTable.scan(dexBytes, oldPackage)
+
+    /** Which of a dex's package strings [rewrite] would move: the ones that do not name a class. */
+    fun willMove(packageStrings: Set<String>, index: ClassIndex): Int =
+        packageStrings.count { it !in index }
 
     /**
      * Rewrites one dex read from [input], writing the result to [output].

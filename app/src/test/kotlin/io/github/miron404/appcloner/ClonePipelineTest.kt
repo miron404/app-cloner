@@ -22,6 +22,7 @@ import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
@@ -47,7 +48,8 @@ class ClonePipelineTest {
     @get:Rule
     val temporaryFolder = TemporaryFolder()
 
-    private val clonePackage = "io.github.miron404.appcloner.pipelineclone"
+    /** Outside [NAMESPACE], so a deep rename from there cannot land the new names under it. */
+    private val clonePackage = "io.github.miron404.pipelineclone"
 
     @Test
     fun `builds a renamed, re-iconed, signed clone`() {
@@ -84,35 +86,70 @@ class ClonePipelineTest {
         }
     }
 
+    /**
+     * The fixture's own package is `….appcloner.debug`, and not one string in its dex files is
+     * that or under it: the classes live in the namespace, which the suffix makes a different
+     * package. So there is nothing to rewrite, and the indexing pass is enough to know it — which
+     * on a phone is the difference between a build and a refusal, because the 42 MB dex alone
+     * would have failed the heap check.
+     */
     @Test
-    fun `deep rename reports what it changed and still verifies`() {
+    fun `a deep rename with nothing to move never starts the worker`() {
         val source = fixture() ?: return
-        val report = build(source, deepRename = true)
+        val worker = FakeDexWorker(heapLimit = 0) { error("nothing should have been sent") }
 
-        val dex = requireNotNull(report.dex) { "deep rename produced no report" }
+        val report = build(source, deepRename = true, worker = worker)
+
+        assertFalse("a worker was opened with nothing for it to do", worker.opened)
+        val dex = requireNotNull(report.dex) { "a deep rename should still report on the dex" }
         assertTrue("no dex files were seen", dex.dexFiles > 0)
-        // The fixture's applicationId is the namespace plus '.debug', and the namespace is what
-        // appears in string constants, so the applicationId prefix matches little on its own.
-        // What matters is that the pass ran and the result is still a valid, signable APK.
+        assertEquals(0, dex.rewrittenStrings)
         val verification = ApkSigningService.verify(report.outputs.single(), null)
         assertTrue(verification.errors.joinToString(" | "), verification.verified)
     }
 
     /**
-     * A deep rename the worker's heap could never hold is refused before the indexing pass, and
+     * Renaming from the namespace, as a release build — whose applicationId has no suffix — would
+     * be renamed. Its strings are in a few small dex files of the app's own code, and those are
+     * the only ones the worker is given; the library dex files, the 42 MB one among them, are not.
+     */
+    @Test
+    fun `deep rename sends only the dex files with something to move, and still verifies`() {
+        val source = fixture(packageName = NAMESPACE) ?: return
+        val real = InProcessDexWorker()
+        val worker = FakeDexWorker(heapLimit = real.heapLimit) { real.rewrite(it) }
+
+        val report = build(source, deepRename = true, worker = worker)
+
+        val dex = requireNotNull(report.dex) { "deep rename produced no report" }
+        assertTrue("nothing was rewritten, so nothing was proved", dex.rewrittenStrings > 0)
+        assertTrue("no dex was sent to the worker", worker.entries.isNotEmpty())
+        assertTrue(
+            "every dex was sent, including ones with nothing to move: ${worker.entries}",
+            worker.entries.size < dex.dexFiles,
+        )
+        assertFalse("classes.dex holds only libraries", "classes.dex" in worker.entries)
+        assertTrue("the worker was left running", worker.closed)
+        val verification = ApkSigningService.verify(report.outputs.single(), null)
+        assertTrue(verification.errors.joinToString(" | "), verification.verified)
+    }
+
+    /**
+     * A deep rename the worker's heap could never hold is refused before anything is sent, and
      * the worker — on a device, a process of its own — is shut down rather than left running.
      */
     @Test
     fun `deep rename is refused up front when the worker's heap is too small`() {
-        val source = fixture() ?: return
-        val worker = FakeDexWorker(heapLimit = 64L * 1024 * 1024, outcome = DexOutcome())
+        val source = fixture(packageName = NAMESPACE) ?: return
+        // Less than the reserve alone, so no dex at all would fit.
+        val worker = FakeDexWorker(heapLimit = 16L * 1024 * 1024) { DexOutcome() }
 
         val refusal = assertThrows(IllegalStateException::class.java) {
             build(source, deepRename = true, worker = worker)
         }
 
         assertTrue(refusal.message, refusal.message.orEmpty().contains("deep rename"))
-        assertEquals("nothing should have been sent to the worker", 0, worker.jobs)
+        assertEquals("nothing should have been sent to the worker", 0, worker.entries.size)
         assertTrue("the worker was left running", worker.closed)
     }
 
@@ -122,40 +159,43 @@ class ClonePipelineTest {
      */
     @Test
     fun `a worker that runs out of memory fails the build and is shut down`() {
-        val source = fixture() ?: return
-        val worker = FakeDexWorker(heapLimit = Long.MAX_VALUE, outcome = DexOutcome(outOfMemory = true))
+        val source = fixture(packageName = NAMESPACE) ?: return
+        val worker = FakeDexWorker(heapLimit = Long.MAX_VALUE) { DexOutcome(outOfMemory = true) }
 
         val failure = assertThrows(IllegalStateException::class.java) {
             build(source, deepRename = true, worker = worker)
         }
 
+        assertEquals("the build should stop at the first dex that fails", 1, worker.entries.size)
         assertTrue(failure.message, failure.message.orEmpty().contains("ran out"))
-        assertTrue(failure.message, failure.message.orEmpty().contains("classes.dex"))
-        assertEquals("the build should stop at the first dex that fails", 1, worker.jobs)
+        assertTrue(failure.message, failure.message.orEmpty().contains(worker.entries.single()))
         assertTrue("the worker was left running", worker.closed)
     }
 
     @Test
     fun `no worker is started when deep rename is off`() {
-        val source = fixture() ?: return
-        val worker = FakeDexWorker(heapLimit = Long.MAX_VALUE, outcome = DexOutcome())
+        val source = fixture(packageName = NAMESPACE) ?: return
+        val worker = FakeDexWorker(heapLimit = Long.MAX_VALUE) { DexOutcome() }
 
-        build(source, deepRename = false, worker = worker)
+        val report = build(source, deepRename = false, worker = worker)
 
-        assertEquals(0, worker.jobs)
+        assertEquals(0, worker.entries.size)
         assertFalse("a worker was opened for a build that had no use for it", worker.opened)
+        assertNull(report.dex)
     }
 
-    /** Answers every job with [outcome], and remembers what was asked of it. */
-    private class FakeDexWorker(override val heapLimit: Long, private val outcome: DexOutcome) :
-        DexWorker {
+    /** Answers every job through [answer], and remembers which dex entries it was asked about. */
+    private class FakeDexWorker(
+        override val heapLimit: Long,
+        private val answer: suspend (DexJob) -> DexOutcome,
+    ) : DexWorker {
         var opened = false
-        var jobs = 0
+        val entries = mutableListOf<String>()
         var closed = false
 
         override suspend fun rewrite(job: DexJob): DexOutcome {
-            jobs++
-            return outcome
+            entries += job.entry
+            return answer(job)
         }
 
         override fun close() {
@@ -203,15 +243,20 @@ class ClonePipelineTest {
         }
     }
 
-    /** The fixture as the pipeline wants it, or null when there is no debug build to use. */
-    private fun fixture(): SourceApks? {
+    /**
+     * The fixture as the pipeline wants it, or null when there is no debug build to use.
+     *
+     * [packageName] stands in for the package the source is said to have; the pipeline renames
+     * from that one, whatever the manifest says.
+     */
+    private fun fixture(packageName: String? = null): SourceApks? {
         val apk = findDebugApk()
         assumeTrue("No debug APK built yet", apk != null)
         requireNotNull(apk)
         val info = ApkSigningService.inspect(apk)
         return SourceApks(
             info = SourceInfo(
-                packageName = requireNotNull(info.packageName),
+                packageName = packageName ?: requireNotNull(info.packageName),
                 label = "App Cloner",
                 versionName = "1.0.0",
                 versionCode = info.versionCode,
@@ -224,6 +269,9 @@ class ClonePipelineTest {
     }
 
     companion object {
+        /** Where the fixture's classes live, and so what its strings are named after. */
+        private const val NAMESPACE = "io.github.miron404.appcloner"
+
         @BeforeClass
         @JvmStatic
         fun installProvider() {

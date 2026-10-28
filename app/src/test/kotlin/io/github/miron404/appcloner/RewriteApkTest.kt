@@ -114,16 +114,33 @@ class RewriteApkTest {
         val index = DexRewriter.ClassIndex(classNames)
 
         var rewrittenAny = false
+        var unchangedAny = false
         ZipFile(source).use { zip ->
             val entries = zip.entries().asSequence()
                 .filter { DexRewriter.isDexEntry(it.name) }
                 .toList()
             for (entry in entries) {
                 val output = File(temporaryFolder.root, "rewritten-${entry.name}")
-                val result = zip.getInputStream(entry).use { stream ->
-                    DexRewriter.rewrite(stream, old, new, index, output)
+                val bytes = zip.getInputStream(entry).use { it.readBytes() }
+                val result = DexRewriter.rewrite(bytes.inputStream(), old, new, index, output)
+
+                // The pipeline only sends a dex to be rewritten when the scan says it will change,
+                // so the scan has to agree with the rewrite exactly, on every dex there is.
+                val strings = DexRewriter.scan(bytes, old).packageStrings
+                assertEquals(
+                    "the scan mispredicted what moves in ${entry.name}",
+                    result.changed,
+                    DexRewriter.willMove(strings, index),
+                )
+                assertEquals(
+                    "the scan mispredicted what is spared in ${entry.name}",
+                    result.skipped,
+                    strings.size - result.changed,
+                )
+                if (!result.written) {
+                    unchangedAny = true
+                    continue
                 }
-                if (!result.written) continue
                 rewrittenAny = true
                 assertTrue("nothing was renamed in ${entry.name}", result.changed > 0)
 
@@ -155,6 +172,7 @@ class RewriteApkTest {
             }
         }
         assertTrue("nothing was rewritten, so nothing was proved", rewrittenAny)
+        assertTrue("every dex changed, so skipping one was never predicted", unchangedAny)
     }
 
     /** Hands each dex in [apk] to [action] one at a time, so only one is ever held in memory. */
